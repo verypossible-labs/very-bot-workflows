@@ -87,27 +87,22 @@ jobs:
             esac
           }
           mkdir -p "$HOME/.claude/skills/$skill"
-          fetch "/skills/very-engineering/$skill" "$HOME/.claude/skills/$skill/SKILL.md"
+          skill_file="$HOME/.claude/skills/$skill/SKILL.md"
+          fetch "/skills/very-engineering/$skill" "$skill_file"
+          # A skill's allowed-tools frontmatter outranks --allowedTools; drop it (and any
+          # indented list under it) so the audit stays read-only, and fail if it survives.
+          awk 'NR == 1 && /^---$/ { fm = 1; print; next }
+               fm && /^---$/ { fm = 0 }
+               fm && /^allowed-tools:/ { skip = 1; next }
+               skip && /^[[:space:]]/ { next }
+               { skip = 0; print }' "$skill_file" > "$skill_file.tmp"
+          mv "$skill_file.tmp" "$skill_file"
+          if awk 'NR > 1 && /^---$/ { exit } /^allowed-tools:/ { found = 1 } END { exit !found }' "$skill_file"; then
+            echo "::error::Couldn't remove the skill's allowed-tools."
+            exit 1
+          fi
           # Never echoed: it holds the client's AWS account IDs.
           fetch /context "$RUNNER_TEMP/client-context.yaml"
-
-      - name: Use very-bot's token for this repo
-        env:
-          FALLBACK: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          # Comments post as very-bot; github.token posts as github-actions.
-          id_token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
-          echo "::add-mask::$id_token"
-          if bot_token=$(curl -sS --fail -X POST -H "Authorization: Bearer $id_token" \
-              "$VERY_BOT_URL/github-token" | jq -er .token); then
-            echo "::add-mask::$bot_token"
-            echo "GH_TOKEN=$bot_token" >> "$GITHUB_ENV"
-          else
-            echo "::warning::Couldn't get very-bot's token; this audit posts as github-actions."
-            echo "GH_TOKEN=$FALLBACK" >> "$GITHUB_ENV"
-          fi
 
       - run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
@@ -124,9 +119,8 @@ jobs:
           set -euo pipefail
           date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
           date +%s > "$RUNNER_TEMP/started_epoch"
-          # Any static credential silently outranks workload identity, and the audit only
-          # reads, so it gets no GitHub token either.
-          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN
+          # Any static credential silently outranks workload identity.
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
           export ANTHROPIC_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/gha-jwt"
           fetch_jwt() {
             curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
@@ -150,8 +144,8 @@ jobs:
           - A row that needs GitHub settings (environments, secrets, rulesets, reviewers),
             AWS, a console, or running the app is not_checked, with the reason as its
             detail. Never guess.
-          - You can't write files. Your final message is only this JSON object, nothing else:
-            {\"checks\": [{\"id\": \"<the row's ID, verbatim>\",
+          - You can't write files or run commands. Return the findings as the structured
+            output: {\"checks\": [{\"id\": \"<the row's ID, verbatim>\",
               \"check\": \"<the row's check text, verbatim, at most 200 characters>\",
               \"status\": \"pass\" | \"fail\" | \"not_checked\",
               \"detail\": \"<what's wrong, or why not checked>\",
@@ -163,25 +157,59 @@ jobs:
           - file is relative to the repository root (no leading / and no ..), at most
             300 characters."
 
-          claude -p "$prompt" \
+          schema='{"type": "object", "required": ["checks"], "properties": {"checks": {
+            "type": "array", "minItems": 1, "maxItems": 200, "items": {
+              "type": "object", "required": ["id", "check", "status"], "properties": {
+                "id": {"type": "string"}, "check": {"type": "string", "maxLength": 200},
+                "status": {"enum": ["pass", "fail", "not_checked"]},
+                "detail": {"type": "string", "maxLength": 500},
+                "file": {"type": "string", "maxLength": 300}}}}}}'
+
+          # Nothing from the checkout configures Claude Code: its .claude/ and .mcp.json
+          # can hold hooks and MCP servers that run code in this job.
+          find . -name .claude -prune -exec rm -rf {} +
+          rm -f .mcp.json
+          # The model reads untrusted files, so it gets no way to write, run code, see the
+          # OIDC request credentials (env -u) or read the Anthropic JWT on disk.
+          env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+            claude -p "$prompt" \
             --model "$MODEL" --output-format stream-json --verbose \
-            --allowedTools Read Glob Grep "Bash(ls:*)" "Bash(jq:*)" Agent Task Skill \
-            --disallowedTools ScheduleWakeup CronCreate \
+            --setting-sources user --strict-mcp-config --json-schema "$schema" \
+            --allowedTools Read Glob Grep "Bash(ls:*)" Agent Task Skill \
+            --disallowedTools ScheduleWakeup CronCreate Write Edit NotebookEdit \
+              "Read(/$ANTHROPIC_IDENTITY_TOKEN_FILE*)" "Read(//proc/**)" \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
             > "$RUNNER_TEMP/result.json"
           jq '{is_error, num_turns, total_cost_usd, duration_ms}' "$RUNNER_TEMP/result.json"
-          # The model can only read, so the findings come back as its final answer.
-          jq -r '.result // ""' "$RUNNER_TEMP/result.json" | python3 -I -c '
-          import json, sys
-          text = sys.stdin.read()
-          json.dump(json.loads(text[text.find("{"):text.rfind("}") + 1]), sys.stdout)
-          ' > "$findings" 2>/dev/null || rm -f "$findings"
+          # --json-schema validates the findings before Claude Code returns them.
+          jq -e '.structured_output // empty' "$RUNNER_TEMP/result.json" > "$findings" \
+            || rm -f "$findings"
 
           if ! jq -e '.is_error == false' "$RUNNER_TEMP/result.json" > /dev/null \
               || ! jq -e '.checks | type == "array" and length > 0' "$findings" > /dev/null 2>&1; then
             echo "::error::The audit didn't finish or wrote no findings; see the transcript artifact."
             exit 1
+          fi
+
+      # After the audit, so very-bot's token never enters the audit's processes.
+      - name: Use very-bot's token for this repo
+        if: always()
+        env:
+          FALLBACK: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Comments post as very-bot; github.token posts as github-actions.
+          id_token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$id_token"
+          if bot_token=$(curl -sS --fail -X POST -H "Authorization: Bearer $id_token" \
+              "$VERY_BOT_URL/github-token" | jq -er .token); then
+            echo "::add-mask::$bot_token"
+            echo "GH_TOKEN=$bot_token" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Couldn't get very-bot's token; this audit posts as github-actions."
+            echo "GH_TOKEN=$FALLBACK" >> "$GITHUB_ENV"
           fi
 
       - name: Send the findings to very-bot and post them on the issue

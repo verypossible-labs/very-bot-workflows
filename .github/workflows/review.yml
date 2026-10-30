@@ -125,10 +125,18 @@ jobs:
           # The full transcript is uploaded below, so slow or wrong reviews can be traced.
           # No scheduling: claude -p waits for a scheduled wakeup before exiting, which left
           # runs idle ~17 minutes after posting. Subagents report back without one.
-          claude -p "/very-code-review $PR_URL" \
+          # The PR's own .claude/ and .mcp.json never configure Claude Code (hooks and MCP
+          # servers would run code here), and the model never sees the OIDC request
+          # credentials. gh and git are limited to what the review skill uses: gh aliases,
+          # extensions and git -c can run code.
+          env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+            claude -p "/very-code-review $PR_URL" \
             --model "$MODEL" --output-format stream-json --verbose \
-            --allowedTools "Bash(gh:*)" "Bash(git:*)" "Bash(jq:*)" Read Glob Grep Agent Task Skill \
-            --disallowedTools ScheduleWakeup CronCreate \
+            --setting-sources user --strict-mcp-config \
+            --allowedTools "Bash(gh api:*)" "Bash(gh pr:*)" "Bash(git log:*)" "Bash(git diff:*)" \
+              "Bash(git show:*)" "Bash(git blame:*)" "Bash(git remote get-url:*)" "Bash(jq:*)" \
+              Read Glob Grep Agent Task Skill \
+            --disallowedTools ScheduleWakeup CronCreate "Read(/$ANTHROPIC_IDENTITY_TOKEN_FILE*)" "Read(//proc/**)" \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
             > "$RUNNER_TEMP/result.json"
