@@ -50,7 +50,8 @@ Very's setup for your organization:
 | `VERY_BOT_WORKSPACE_ID` | `wrkspc_…` |
 
 Then each repository gets this file through a pull request. It's the same in every
-repository:
+repository, and replaces an older `very-review.yml`: delete that in the same pull
+request, or each label runs two reviews.
 
 ```yaml
 # .github/workflows/very-bot.yml

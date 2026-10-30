@@ -34,11 +34,13 @@ env:
 jobs:
   audit:
     # Only very-bot labelling its own issue starts an audit, so nobody in the client org
-    # can spend Very's tokens here; audits have no monthly cap for that reason.
+    # can spend Very's tokens here; audits have no monthly cap for that reason. A re-run
+    # replays the event but changes triggering_actor, so it doesn't pass.
     if: >-
       github.event.label.name == 'very-audit'
       && github.event.sender.login == 'very-bot[bot]'
       && github.event.issue.user.login == 'very-bot[bot]'
+      && github.triggering_actor == 'very-bot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -122,8 +124,9 @@ jobs:
           set -euo pipefail
           date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
           date +%s > "$RUNNER_TEMP/started_epoch"
-          # Any static credential silently outranks workload identity.
-          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+          # Any static credential silently outranks workload identity, and the audit only
+          # reads, so it gets no GitHub token either.
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN
           export ANTHROPIC_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/gha-jwt"
           fetch_jwt() {
             curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
@@ -189,7 +192,7 @@ jobs:
               '{skill: $skill, issue: $issue, checks: .checks}' "$RUNNER_TEMP/findings.json" \
             | curl -sS -w '%{http_code}' -X POST -H "Authorization: Bearer $token" \
               -H "content-type: application/json" --data @- "$VERY_BOT_URL/audits" \
-              -o "$RUNNER_TEMP/final.json")
+              -o "$RUNNER_TEMP/final.json") || true
           case "$status" in
             200) ;;
             409)
@@ -204,8 +207,8 @@ jobs:
           jq -r --arg skill "$SKILL" --arg run "$RUN_URL" --arg sha "${GITHUB_SHA:0:7}" '
             def count(s): [.checks[] | select(.status == s)] | length;
             def item: "- **\(.check)**"
-              + (if .detail then ": \(.detail)" else "" end)
-              + (if .file then " (`\(.file)`)" else "" end);
+              + (if (.detail // "") != "" then ": \(.detail)" else "" end)
+              + (if (.file // "") != "" then " (`\(.file)`)" else "" end);
             def section(s; title):
               if count(s) > 0
               then ("<details><summary>\(title) (\(count(s)))</summary>", "",
@@ -215,7 +218,9 @@ jobs:
               else empty end;
             "### very-bot audit: `\($skill)`",
             "",
-            (if count("fail") == 0 then "**All checks pass.**" else "**\(count("fail")) failing.**" end)
+            (if count("fail") > 0 then "**\(count("fail")) failing.**"
+             elif count("pass") > 0 then "**No failing checks.**"
+             else "**Nothing could be checked.**" end)
               + " \(count("pass")) passing, \(count("accepted")) accepted drift, \(count("not_checked")) not checked.",
             "",
             (if count("fail") > 0
@@ -232,13 +237,13 @@ jobs:
           fi
 
       - name: Say the audit couldn't finish
-        if: failure()
+        if: failure() || cancelled()
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FALLBACK: ${{ github.token }}
         run: |
           GH_TOKEN="${GH_TOKEN:-$FALLBACK}" gh issue comment "$ISSUE" \
-            --body "very-bot couldn't finish this audit ([run]($RUN_URL)). Very sees the failure in its run report and can start it again." || true
+            --body "very-bot couldn't finish this audit ([run]($RUN_URL)). Ask your Very engineer to start it again." || true
 
       - name: Report the run to very-bot
         if: always() && steps.audit.outcome != 'skipped'
@@ -257,6 +262,17 @@ jobs:
             | curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" \
               -H "content-type: application/json" --data @- "$VERY_BOT_URL/runs" \
             || echo "::warning::Couldn't report this run to very-bot; the audit itself is unaffected."
+
+      # Tool results go: they include the client context, which must not be downloadable.
+      - name: Strip tool results from the transcript
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/transcript.jsonl" ] || exit 0
+          jq -c 'if .type == "user" and (.message.content | type) == "array"
+                 then .message.content |= map(if .type == "tool_result" then .content = "[omitted]" else . end)
+                 else . end' "$RUNNER_TEMP/transcript.jsonl" > "$RUNNER_TEMP/transcript.stripped.jsonl" \
+            && mv "$RUNNER_TEMP/transcript.stripped.jsonl" "$RUNNER_TEMP/transcript.jsonl" \
+            || rm -f "$RUNNER_TEMP/transcript.jsonl"
 
       - name: Upload the audit transcript
         if: always()
