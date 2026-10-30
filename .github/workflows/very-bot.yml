@@ -1,0 +1,31 @@
+name: very-bot
+on:
+  pull_request:
+    types: [labeled]
+  issues:
+    types: [labeled]
+jobs:
+  review:
+    if: github.event_name == 'pull_request' && github.event.label.name == 'very-review'
+    uses: verypossible-labs/very-bot-workflows/.github/workflows/review.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    with:
+      federation-rule-id: ${{ vars.VERY_BOT_FEDERATION_RULE_ID }}
+      organization-id: ${{ vars.VERY_BOT_ORGANIZATION_ID }}
+      service-account-id: ${{ vars.VERY_BOT_SERVICE_ACCOUNT_ID }}
+      workspace-id: ${{ vars.VERY_BOT_WORKSPACE_ID }}
+  audit:
+    if: github.event_name == 'issues' && github.event.label.name == 'very-audit'
+    uses: verypossible-labs/very-bot-workflows/.github/workflows/audit.yml@v1
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    with:
+      federation-rule-id: ${{ vars.VERY_BOT_FEDERATION_RULE_ID }}
+      organization-id: ${{ vars.VERY_BOT_ORGANIZATION_ID }}
+      service-account-id: ${{ vars.VERY_BOT_SERVICE_ACCOUNT_ID }}
+      workspace-id: ${{ vars.VERY_BOT_WORKSPACE_ID }}
