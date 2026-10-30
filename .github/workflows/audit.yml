@@ -150,7 +150,7 @@ jobs:
           - A row that needs GitHub settings (environments, secrets, rulesets, reviewers),
             AWS, a console, or running the app is not_checked, with the reason as its
             detail. Never guess.
-          - Write $findings as
+          - You can't write files. Your final message is only this JSON object, nothing else:
             {\"checks\": [{\"id\": \"<the row's ID, verbatim>\",
               \"check\": \"<the row's check text, verbatim, at most 200 characters>\",
               \"status\": \"pass\" | \"fail\" | \"not_checked\",
@@ -165,12 +165,18 @@ jobs:
 
           claude -p "$prompt" \
             --model "$MODEL" --output-format stream-json --verbose \
-            --allowedTools Read Glob Grep Write "Bash(git:*)" "Bash(ls:*)" "Bash(jq:*)" Agent Task Skill \
+            --allowedTools Read Glob Grep "Bash(ls:*)" "Bash(jq:*)" Agent Task Skill \
             --disallowedTools ScheduleWakeup CronCreate \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
             > "$RUNNER_TEMP/result.json"
           jq '{is_error, num_turns, total_cost_usd, duration_ms}' "$RUNNER_TEMP/result.json"
+          # The model can only read, so the findings come back as its final answer.
+          jq -r '.result // ""' "$RUNNER_TEMP/result.json" | python3 -I -c '
+          import json, sys
+          text = sys.stdin.read()
+          json.dump(json.loads(text[text.find("{"):text.rfind("}") + 1]), sys.stdout)
+          ' > "$findings" 2>/dev/null || rm -f "$findings"
 
           if ! jq -e '.is_error == false' "$RUNNER_TEMP/result.json" > /dev/null \
               || ! jq -e '.checks | type == "array" and length > 0' "$findings" > /dev/null 2>&1; then
@@ -275,14 +281,26 @@ jobs:
           import json, os, re, sys
 
           transcript, context = sys.argv[1], sys.argv[2]
-          # Every identifier-like token in the file, keys and comments included, so inline
-          # comments and [a, b] lists can't hide a value. Plain words like "pulumi" stay.
-          tokens = re.findall(r"[\w.:/@+-]{6,}", open(context).read()) if os.path.exists(context) else []
-          values = sorted(
-              {t.strip(":.,-") for t in tokens if re.search(r"[\d./:@_-]", t.strip(":.,-"))},
-              key=len,
-              reverse=True,
-          )
+          text = open(context, errors="replace").read() if os.path.exists(context) else ""
+          pieces = []
+          for line in text.splitlines():
+              # Each whole value, without its key, list dash, inline comment or [a, b] brackets.
+              value = re.sub(r"^\s*(-\s+)?([\w.-]+:\s*)?", "", line)
+              value = re.sub(r"(^|\s+)#.*$", "", value).strip()
+              pieces += [value, *value.strip("[]").split(",")] if value.startswith("[") else [value]
+          for token in re.findall(r"[\w.:/@+-]+", text):
+              # Each token and its parts, so an account ID inside an ARN, a URL's host or an
+              # org/repo is caught when quoted alone.
+              pieces += [token, *re.split(r"[:/@]+", token)]
+          # Public hosts stay readable; they say nothing about the client.
+          public = {"github.com", "api.github.com", "gitlab.com", "amazonaws.com"}
+          values = set()
+          for piece in pieces:
+              piece = piece.strip(" '\":.,-[]").removesuffix(".git")
+              # IDs, ARNs, domains and slugs; plain words like "pulumi" stay readable.
+              if len(piece) >= 6 and re.search(r"[\d./:@_-]", piece) and piece not in public:
+                  values.add(piece)
+          values = sorted(values, key=len, reverse=True)
 
           def scrub(node):
               if isinstance(node, dict):
