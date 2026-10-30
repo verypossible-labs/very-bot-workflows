@@ -97,17 +97,27 @@ jobs:
 
       # The model never calls GitHub: the workflow gathers what the skill reads.
       - name: Gather the PR for the review
+        id: gather
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           bundle="$RUNNER_TEMP/bundle"
           mkdir -p "$bundle"
           gh pr view "$PR" --json number,url,state,isDraft,headRefOid,baseRefName,author,title,files \
             > "$bundle/pr.json"
-          gh pr diff "$PR" > "$bundle/diff.patch"
+          # The skill's eligibility rule: closed, draft and bot-authored PRs get no review.
+          if ! jq -e '.state == "OPEN" and (.isDraft | not) and ((.author.is_bot // false) | not)' \
+              "$bundle/pr.json" > /dev/null; then
+            echo "::notice::very-bot doesn't review closed, draft or bot-authored PRs."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # GitHub refuses diffs over 300 files or 20,000 lines; the checkout has full history.
+          gh pr diff "$PR" > "$bundle/diff.patch" || git diff "origin/$BASE...HEAD" > "$bundle/diff.patch"
           gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq '.[]' | jq -s . > "$bundle/reviews.json"
           gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[]' | jq -s . > "$bundle/comments.json"
           gh api graphql -F owner="${REPO%/*}" -F repo="${REPO#*/}" -F pr="$PR" -f query='
@@ -122,9 +132,18 @@ jobs:
                 gh api "repos/$REPO/pulls/$n/comments" --paginate \
                   --jq ".[] | {pr: $n, path, body}"
               done | jq -s . > "$bundle/history.json"
+          # Git history for the skill, which gets no git or shell in CI.
+          mkdir -p "$bundle/git"
+          git log --oneline -30 > "$bundle/git/log.txt"
+          jq -r '.files[].path' "$bundle/pr.json" | head -50 | while read -r f; do
+            name=$(printf '%s' "$f" | tr '/' '_')
+            git log --oneline -15 -- "$f" > "$bundle/git/$name.log" || true
+            if [ -f "$f" ]; then git blame -w --date=short -- "$f" > "$bundle/git/$name.blame" || true; fi
+          done
 
       - name: Review
         id: review
+        if: steps.gather.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -138,25 +157,29 @@ jobs:
           date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
           date +%s > "$RUNNER_TEMP/started_epoch"
 
-          # Claude runs as its own user, so neither the model nor anything a PR tricks it
-          # into running can read this user's environment (the OIDC request credentials)
-          # or the runner's files. Without sudo (some self-hosted runners) it shares ours.
+          # Claude runs as a fresh user of its own, so nothing a PR tricks it into can reach
+          # this user's environment (the OIDC credentials) or files. Without sudo (some
+          # self-hosted runners) it shares ours, still with no shell and no writes.
           if sudo -n true 2>/dev/null; then
-            sudo useradd --create-home very-bot-model 2>/dev/null || true
+            sudo pkill -KILL -u very-bot-model 2>/dev/null || true
+            sudo userdel -r -f very-bot-model 2>/dev/null || true
+            sudo useradd --create-home very-bot-model
             model_home=/home/very-bot-model
             as_model() { sudo -u very-bot-model "$@"; }
+            # Root reads our files and leaves read-only copies the model can't change.
+            put() { sudo install -D -o root -g root -m 644 "$1" "$2"; }
           else
             echo "::warning::No passwordless sudo on this runner; the review runs as the runner user."
             model_home="$RUNNER_TEMP/model-home"
             as_model() { "$@"; }
+            put() { install -D -m 644 "$1" "$2"; }
           fi
-          as_model mkdir -p "$model_home/.claude/skills/very-code-review" "$model_home/repo" "$model_home/bundle"
-          as_model cp "$RUNNER_TEMP/very-code-review/SKILL.md" "$model_home/.claude/skills/very-code-review/"
+          as_model mkdir -p "$model_home/.claude" "$model_home/repo" "$model_home/bundle"
+          put "$RUNNER_TEMP/very-code-review/SKILL.md" "$model_home/.claude/skills/very-code-review/SKILL.md"
+          echo '{}' > "$RUNNER_TEMP/settings.json"
+          put "$RUNNER_TEMP/settings.json" "$model_home/.claude/settings.json"
           tar -C . -cf - . | as_model tar -C "$model_home/repo" -xf -
           tar -C "$RUNNER_TEMP/bundle" -cf - . | as_model tar -C "$model_home/bundle" -xf -
-          # User settings load (--setting-sources user); make them unwritable by the model.
-          echo '{}' | sudo -n tee "$model_home/.claude/settings.json" > /dev/null 2>&1 \
-            && sudo -n chown root:root "$model_home/.claude/settings.json" || true
 
           # The model's user works only from its own copies; it can't list the runner's temp dir.
           chmod 700 "$RUNNER_TEMP"
@@ -188,9 +211,8 @@ jobs:
                 "body": {"type": "string"}}}},
             "resolve": {"type": "array", "items": {"type": "string"}}}}'
 
-          # The model only reads: no gh, no token, no writes. The PR's own .claude/ and
-          # .mcp.json never configure Claude Code. The full transcript is uploaded below.
-          # No scheduling: claude -p waits for a scheduled wakeup before exiting.
+          # The model only reads: no shell, git, gh, token or writes. The PR's .claude/ and
+          # .mcp.json never configure Claude Code. No scheduling: claude -p waits for it.
           as_model env -i HOME="$model_home" PATH="$PATH" \
             ANTHROPIC_FEDERATION_RULE_ID="$ANTHROPIC_FEDERATION_RULE_ID" \
             ANTHROPIC_ORGANIZATION_ID="$ANTHROPIC_ORGANIZATION_ID" \
@@ -201,9 +223,8 @@ jobs:
             -p "/very-code-review --ci $model_home/bundle $PR_URL" \
             --model "$MODEL" --output-format stream-json --verbose \
             --setting-sources user --strict-mcp-config --json-schema "$schema" \
-            --allowedTools Read Glob Grep "Bash(git log:*)" "Bash(git blame:*)" \
-              "Bash(git show:*)" "Bash(git diff:*)" Agent Task Skill \
-            --disallowedTools ScheduleWakeup CronCreate Write Edit NotebookEdit \
+            --allowedTools Read Glob Grep Agent Task Skill \
+            --disallowedTools ScheduleWakeup CronCreate Bash Write Edit NotebookEdit \
               "Read(/$jwt*)" "Read(//proc/**)" \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
@@ -240,21 +261,45 @@ jobs:
           fi
 
       - name: Post the review
+        if: steps.review.outcome == 'success'
         env:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 -I - "$RUNNER_TEMP/review.json" <<'PY'
           import json, os, re, sys, urllib.error, urllib.request
 
           review = json.load(open(sys.argv[1]))
+          bundle = os.environ["RUNNER_TEMP"] + "/bundle"
           repo, pr = os.environ["REPO"], os.environ["PR"]
           # The model can't reach our tokens, but never post anything shaped like one.
           TOKEN = re.compile(r"eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}|gh[pousr]_\w{20,}|github_pat_\w{20,}")
+          MARKER = "_very-code-review"
 
           def clean(text):
               return TOKEN.sub("[redacted]", text)
+
+          def above_marker(body, text):
+              at = body.rfind(MARKER)
+              return f"{body[:at]}{text}\n\n{body[at:]}" if at >= 0 else f"{body}\n\n{text}"
+
+          def anchorable(patch):
+              """The new-side lines in each file's hunks: the only lines GitHub anchors to."""
+              lines, path, n = {}, None, 0
+              for row in patch.splitlines():
+                  if row.startswith("diff --git"):
+                      path = None
+                  elif row.startswith("+++ "):
+                      path = row[6:] if row.startswith("+++ b/") else None
+                  elif row.startswith("@@"):
+                      n = int(re.match(r"@@ -\S+ \+(\d+)", row).group(1))
+                  elif path and row[:1] in ("+", " "):
+                      lines.setdefault(path, set()).add(n)
+                      n += 1
+              return lines
+
+          def as_list(comments):
+              return "\n".join(f"- `{c['path']}:{c['line']}` {c['body']}" for c in comments)
 
           def github(method, path, body):
               req = urllib.request.Request(
@@ -268,11 +313,13 @@ jobs:
           if action == "noop":
               print("Nothing to post.")
               sys.exit(0)
+          if not review.get("body"):
+              sys.exit(f"::error::The review returned {action} without a body.")
           if action == "cap":
               github("POST", f"/repos/{repo}/issues/{pr}/comments", {"body": clean(review["body"])})
               sys.exit(0)
 
-          threads = {t["id"]: t for t in json.load(open(os.environ["RUNNER_TEMP"] + "/bundle/threads.json"))}
+          threads = {t["id"]: t for t in json.load(open(f"{bundle}/threads.json"))}
           unresolved = []
           for thread_id in review.get("resolve", []):
               if thread_id not in threads:
@@ -283,20 +330,24 @@ jobs:
                   unresolved.append(threads[thread_id]["comments"]["nodes"][0]["url"])
           body = clean(review["body"])
           if unresolved:
-              lines = "\n".join(unresolved)
-              body = body.replace("\n\n_very-code-review", f"\n\nFixed, but I couldn't resolve these threads; resolve them by hand:\n{lines}\n\n_very-code-review", 1)
+              body = above_marker(body, "Fixed, but I couldn't resolve these threads; resolve them by hand:\n" + "\n".join(unresolved))
 
-          comments = [{"path": c["path"], "line": c["line"], "side": "RIGHT", "body": clean(c["body"])}
-                      for c in review.get("comments", [])]
-          payload = {"commit_id": os.environ["HEAD_SHA"], "event": "COMMENT", "body": body, "comments": comments}
+          # A line outside the diff makes GitHub reject the whole review, so move just those.
+          anchors = anchorable(open(f"{bundle}/diff.patch").read())
+          inline, moved = [], []
+          for c in review.get("comments", []):
+              comment = {"path": c["path"], "line": c["line"], "side": "RIGHT", "body": clean(c["body"])}
+              (inline if c["line"] in anchors.get(c["path"], ()) else moved).append(comment)
+          if moved:
+              body = above_marker(body, as_list(moved))
+          head = json.load(open(f"{bundle}/pr.json"))["headRefOid"]
+          payload = {"commit_id": head, "event": "COMMENT", "body": body, "comments": inline}
           try:
               github("POST", f"/repos/{repo}/pulls/{pr}/reviews", payload)
           except urllib.error.HTTPError as exc:
-              if exc.code != 422 or not comments:
+              if exc.code != 422 or not inline:
                   raise
-              # A line GitHub can't anchor rejects the whole review: move findings into the body.
-              moved = "\n".join(f"- `{c['path']}:{c['line']}` {c['body']}" for c in comments)
-              payload |= {"comments": [], "body": body.replace("\n\n_very-code-review", f"\n\n{moved}\n\n_very-code-review", 1)}
+              payload |= {"comments": [], "body": above_marker(body, as_list(inline))}
               github("POST", f"/repos/{repo}/pulls/{pr}/reviews", payload)
           PY
 
@@ -344,3 +395,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr edit "${{ github.event.pull_request.number }}" --remove-label very-review || true
+
+      - name: Remove the model's user
+        if: always()
+        run: |
+          sudo -n pkill -KILL -u very-bot-model 2>/dev/null || true
+          sudo -n userdel -r -f very-bot-model 2>/dev/null || true

@@ -119,26 +119,29 @@ jobs:
           set -euo pipefail
           date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
           date +%s > "$RUNNER_TEMP/started_epoch"
-          # Claude runs as its own user, so neither the model nor anything the repo tricks
-          # it into running can read this user's environment (the OIDC request
-          # credentials) or the runner's files. Without sudo (some self-hosted runners) it
-          # shares ours.
+          # Claude runs as a fresh user of its own, so nothing the repo tricks it into can
+          # reach this user's environment (the OIDC credentials) or files. Without sudo (some
+          # self-hosted runners) it shares ours, still with no writes and only ls.
           if sudo -n true 2>/dev/null; then
-            sudo useradd --create-home very-bot-model 2>/dev/null || true
+            sudo pkill -KILL -u very-bot-model 2>/dev/null || true
+            sudo userdel -r -f very-bot-model 2>/dev/null || true
+            sudo useradd --create-home very-bot-model
             model_home=/home/very-bot-model
             as_model() { sudo -u very-bot-model "$@"; }
+            # Root reads our files and leaves read-only copies the model can't change.
+            put() { sudo install -D -o root -g root -m 644 "$1" "$2"; }
           else
             echo "::warning::No passwordless sudo on this runner; the audit runs as the runner user."
             model_home="$RUNNER_TEMP/model-home"
             as_model() { "$@"; }
+            put() { install -D -m 644 "$1" "$2"; }
           fi
-          as_model mkdir -p "$model_home/.claude/skills/$SKILL" "$model_home/repo" "$model_home/context"
-          as_model cp "$RUNNER_TEMP/skill/SKILL.md" "$model_home/.claude/skills/$SKILL/"
-          as_model cp "$RUNNER_TEMP/client-context.yaml" "$model_home/context/"
+          as_model mkdir -p "$model_home/.claude" "$model_home/repo"
+          put "$RUNNER_TEMP/skill/SKILL.md" "$model_home/.claude/skills/$SKILL/SKILL.md"
+          put "$RUNNER_TEMP/client-context.yaml" "$model_home/context/client-context.yaml"
+          echo '{}' > "$RUNNER_TEMP/settings.json"
+          put "$RUNNER_TEMP/settings.json" "$model_home/.claude/settings.json"
           tar -C . -cf - . | as_model tar -C "$model_home/repo" -xf -
-          # User settings load (--setting-sources user); make them unwritable by the model.
-          echo '{}' | sudo -n tee "$model_home/.claude/settings.json" > /dev/null 2>&1 \
-            && sudo -n chown root:root "$model_home/.claude/settings.json" || true
 
           # The model's user works only from its own copies; it can't list the runner's temp dir.
           chmod 700 "$RUNNER_TEMP"
@@ -389,3 +392,9 @@ jobs:
           path: ${{ runner.temp }}/transcript.jsonl
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: Remove the model's user
+        if: always()
+        run: |
+          sudo -n pkill -KILL -u very-bot-model 2>/dev/null || true
+          sudo -n userdel -r -f very-bot-model 2>/dev/null || true
