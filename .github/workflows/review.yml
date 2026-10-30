@@ -82,9 +82,12 @@ jobs:
           (while sleep 240; do fetch_jwt; done) &
 
           # The full transcript is uploaded below, so slow or wrong reviews can be traced.
+          # No scheduling: claude -p waits for a scheduled wakeup before exiting, which left
+          # runs idle ~17 minutes after posting. Subagents report back without one.
           claude -p "/very-code-review $PR_URL" \
             --model "$MODEL" --output-format stream-json --verbose \
             --allowedTools "Bash(gh:*)" "Bash(git:*)" "Bash(jq:*)" Read Glob Grep Agent Task Skill \
+            --disallowedTools ScheduleWakeup CronCreate \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
             > "$RUNNER_TEMP/result.json"
