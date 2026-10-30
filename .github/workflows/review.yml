@@ -138,8 +138,18 @@ jobs:
           jq -r '.files[].path' "$bundle/pr.json" | head -50 | while read -r f; do
             name=$(printf '%s' "$f" | tr '/' '_')
             git log --oneline -15 -- "$f" > "$bundle/git/$name.log" || true
+            git log -p -3 --format='commit %h %s' -- "$f" | head -c 100000 > "$bundle/git/$name.patches" || true
             if [ -f "$f" ]; then git blame -w --date=short -- "$f" > "$bundle/git/$name.blame" || true; fi
           done
+          # A re-review covers only what changed since the last reviewed commit (Step 2.5).
+          last=$(jq -rs 'add | map({t: (.submitted_at // .created_at // ""), b: (.body // "")})
+              | sort_by(.t) | .[].b' "$bundle/reviews.json" "$bundle/comments.json" \
+            | grep -oE '_very-code-review · cycle [^_]*· [0-9a-f]{7,40}_' | tail -1 \
+            | grep -oE '[0-9a-f]{7,40}_$' | tr -d _ || true)
+          if [ -n "$last" ] && git cat-file -e "$last^{commit}" 2>/dev/null; then
+            git diff "$last...$(jq -r .headRefOid "$bundle/pr.json")" > "$bundle/delta.patch" \
+              || rm -f "$bundle/delta.patch"
+          fi
 
       - name: Review
         id: review
@@ -333,7 +343,7 @@ jobs:
               body = above_marker(body, "Fixed, but I couldn't resolve these threads; resolve them by hand:\n" + "\n".join(unresolved))
 
           # A line outside the diff makes GitHub reject the whole review, so move just those.
-          anchors = anchorable(open(f"{bundle}/diff.patch").read())
+          anchors = anchorable(open(f"{bundle}/diff.patch", errors="replace").read())
           inline, moved = [], []
           for c in review.get("comments", []):
               comment = {"path": c["path"], "line": c["line"], "side": "RIGHT", "body": clean(c["body"])}
