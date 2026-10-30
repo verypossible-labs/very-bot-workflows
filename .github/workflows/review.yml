@@ -212,15 +212,6 @@ jobs:
           fetch_jwt
           (while sleep 240; do fetch_jwt; done) &
 
-          schema='{"type": "object", "required": ["action"], "properties": {
-            "action": {"enum": ["review", "cap", "noop"]},
-            "body": {"type": "string"},
-            "comments": {"type": "array", "items": {"type": "object",
-              "required": ["path", "line", "body"], "properties": {
-                "path": {"type": "string"}, "line": {"type": "integer"},
-                "body": {"type": "string"}}}},
-            "resolve": {"type": "array", "items": {"type": "string"}}}}'
-
           # The model only reads: no shell, git, gh, token or writes. The PR's .claude/ and
           # .mcp.json never configure Claude Code. No scheduling: claude -p waits for it.
           as_model env -i HOME="$model_home" PATH="$PATH" \
@@ -232,7 +223,7 @@ jobs:
             bash -c 'cd "$1/repo" && shift && exec claude "$@"' _ "$model_home" \
             -p "/very-code-review --ci $model_home/bundle $PR_URL" \
             --model "$MODEL" --output-format stream-json --verbose \
-            --setting-sources user --strict-mcp-config --json-schema "$schema" \
+            --setting-sources user --strict-mcp-config \
             --allowedTools Read Glob Grep Agent Task Skill \
             --disallowedTools ScheduleWakeup CronCreate Bash Write Edit NotebookEdit \
               "Read(/$jwt*)" "Read(//proc/**)" \
@@ -248,7 +239,23 @@ jobs:
             fi
             exit 1
           fi
-          jq -e '.structured_output // empty' "$RUNNER_TEMP/result.json" > "$RUNNER_TEMP/review.json"
+          # No --json-schema: it demands an answer whenever a turn ends, even while the
+          # fan-out runs. The final message ends with the review; take its last JSON object
+          # with an action (prose like {slug} doesn't parse and is skipped).
+          jq -r '.result // ""' "$RUNNER_TEMP/result.json" | python3 -I -c '
+          import json, sys
+          text, found, decoder = sys.stdin.read(), None, json.JSONDecoder()
+          for at in [i for i, ch in enumerate(text) if ch == "{"]:
+              try:
+                  value = decoder.raw_decode(text, at)[0]
+              except ValueError:
+                  continue
+              if isinstance(value, dict) and "action" in value:
+                  found = value
+          if found is None:
+              sys.exit("::error::The review ended without a result.")
+          json.dump(found, sys.stdout)
+          ' > "$RUNNER_TEMP/review.json"
 
       # After the review, so very-bot's token never enters the model's step.
       - name: Use very-bot's token for this repo
@@ -319,6 +326,20 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as resp:
                   return json.load(resp)
 
+          def valid(review):
+              comments, resolve = review.get("comments", []), review.get("resolve", [])
+              return (
+                  review.get("action") in ("review", "cap", "noop")
+                  and isinstance(review.get("body", ""), str)
+                  and isinstance(comments, list)
+                  and all(isinstance(c, dict) and isinstance(c.get("path"), str)
+                          and type(c.get("line")) is int and isinstance(c.get("body"), str)
+                          for c in comments)
+                  and isinstance(resolve, list) and all(isinstance(t, str) for t in resolve)
+              )
+
+          if not valid(review):
+              sys.exit("::error::The review returned a result in the wrong shape.")
           action = review["action"]
           if action == "noop":
               print("Nothing to post.")
