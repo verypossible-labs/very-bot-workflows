@@ -1,0 +1,17 @@
+name: very-bot review
+on:
+  pull_request:
+    types: [labeled]
+jobs:
+  review:
+    if: github.event.label.name == 'very-review'
+    uses: verypossible-labs/very-bot-workflows/.github/workflows/review.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    with:
+      federation-rule-id: fdrl_0124U8dCpQ8hjwTzFfyGuHdc
+      organization-id: 8e1ffd53-706c-4608-91aa-0be37787de19
+      service-account-id: svac_01Pth63C5ahteKqWyoHdP1uT
+      workspace-id: wrkspc_01MkxiyszEkz6usgPXHRSbt7
