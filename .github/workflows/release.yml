@@ -1,0 +1,43 @@
+name: Release
+
+# Every merge to main cuts vX.Y.Z from its conventional commits and moves the vX tag
+# client callers pin. Tags go over SSH with a deploy key only the `release`
+# environment (main only) holds; the v* tag ruleset lets just that key and admins in.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move the major tag to this release
+        if: steps.semrel.outputs.new_release_published == 'true'
+        env:
+          MAJOR: v${{ steps.semrel.outputs.new_release_major_version }}
+        run: |
+          git tag -f "$MAJOR"
+          git push -f git@github.com:${{ github.repository }}.git "refs/tags/$MAJOR"

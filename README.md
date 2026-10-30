@@ -58,3 +58,9 @@ jobs:
       service-account-id: svac_…
       workspace-id: wrkspc_…
 ```
+
+## Versions
+
+`@v1` always points at the latest v1 release, so fixes reach you without a PR; nothing
+breaking ever lands on it. To freeze on one release instead, pin its full version
+(`@v1.1.0`) or commit SHA. Releases are listed on this repository's Releases page.
