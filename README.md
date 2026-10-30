@@ -13,7 +13,9 @@ They're public so your repositories can call them; nothing else about very-bot l
   your own GitHub Actions and posts comments. It never approves or merges. Remove and
   re-add the label to review again.
 - **Standards audits.** A Very engineer can request an audit, which very-bot opens as an
-  issue labeled `very-audit`. It runs in your Actions and reports findings on the issue.
+  issue labeled `very-audit`. It runs in your Actions, changes nothing, and reports
+  findings on the issue. The issue stays open while a check fails; the next audit
+  replaces it. Only very-bot's own issues start an audit.
 - **Security and dependency checks.** Weekly checks of repository settings, Dependabot
   alerts and outdated dependencies, using GitHub's API.
 
@@ -34,30 +36,55 @@ is ever stored in your repositories.
 
 You can uninstall very-bot at any time from your organization's settings.
 
-## Adding reviews to a repository
+## Adding very-bot to a repository
 
-Your Very engineer adds this file through a pull request. The four IDs are identifiers,
-not secrets; they come from Very's setup for your organization.
+An organization owner sets four organization variables once, under **Settings → Secrets
+and variables → Actions → Variables**. They are identifiers, not secrets, and come from
+Very's setup for your organization:
+
+| Variable | Looks like |
+|---|---|
+| `VERY_BOT_FEDERATION_RULE_ID` | `fdrl_…` |
+| `VERY_BOT_ORGANIZATION_ID` | a UUID |
+| `VERY_BOT_SERVICE_ACCOUNT_ID` | `svac_…` |
+| `VERY_BOT_WORKSPACE_ID` | `wrkspc_…` |
+
+Then each repository gets this file through a pull request. It's the same in every
+repository:
 
 ```yaml
-# .github/workflows/very-review.yml
-name: very-bot review
+# .github/workflows/very-bot.yml
+name: very-bot
 on:
   pull_request:
     types: [labeled]
+  issues:
+    types: [labeled]
 jobs:
   review:
-    if: github.event.label.name == 'very-review'
+    if: github.event_name == 'pull_request' && github.event.label.name == 'very-review'
     uses: verypossible-labs/very-bot-workflows/.github/workflows/review.yml@v1
     permissions:
       contents: read
       pull-requests: write
       id-token: write
     with:
-      federation-rule-id: fdrl_…
-      organization-id: …
-      service-account-id: svac_…
-      workspace-id: wrkspc_…
+      federation-rule-id: ${{ vars.VERY_BOT_FEDERATION_RULE_ID }}
+      organization-id: ${{ vars.VERY_BOT_ORGANIZATION_ID }}
+      service-account-id: ${{ vars.VERY_BOT_SERVICE_ACCOUNT_ID }}
+      workspace-id: ${{ vars.VERY_BOT_WORKSPACE_ID }}
+  audit:
+    if: github.event_name == 'issues' && github.event.label.name == 'very-audit'
+    uses: verypossible-labs/very-bot-workflows/.github/workflows/audit.yml@v1
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    with:
+      federation-rule-id: ${{ vars.VERY_BOT_FEDERATION_RULE_ID }}
+      organization-id: ${{ vars.VERY_BOT_ORGANIZATION_ID }}
+      service-account-id: ${{ vars.VERY_BOT_SERVICE_ACCOUNT_ID }}
+      workspace-id: ${{ vars.VERY_BOT_WORKSPACE_ID }}
 ```
 
 ## Versions

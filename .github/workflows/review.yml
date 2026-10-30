@@ -42,6 +42,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check the very-bot org variables
+        env:
+          IDS: >-
+            ${{ inputs.federation-rule-id }} ${{ inputs.organization-id }}
+            ${{ inputs.service-account-id }} ${{ inputs.workspace-id }}
+        run: |
+          if [ "$(wc -w <<<"$IDS")" -ne 4 ]; then
+            echo "::error::Set the VERY_BOT_* org variables (Settings → Secrets and variables → Actions → Variables) and share them with this repo."
+            exit 1
+          fi
+
       - name: Fetch Very's review skill
         env:
           GH_TOKEN: ${{ github.token }}
