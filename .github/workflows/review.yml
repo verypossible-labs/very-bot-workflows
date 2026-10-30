@@ -42,6 +42,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check the very-bot org variables
+        env:
+          IDS: >-
+            ${{ inputs.federation-rule-id }} ${{ inputs.organization-id }}
+            ${{ inputs.service-account-id }} ${{ inputs.workspace-id }}
+        run: |
+          if [ "$(wc -w <<<"$IDS")" -ne 4 ]; then
+            echo "::error::Set the VERY_BOT_* org variables (Settings → Secrets and variables → Actions → Variables) and share them with this repo."
+            exit 1
+          fi
+
       - name: Fetch Very's review skill
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,10 +64,10 @@ jobs:
           token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
           echo "::add-mask::$token"
-          mkdir -p "$HOME/.claude/skills/very-code-review"
+          skill_file="$RUNNER_TEMP/very-code-review/SKILL.md"
+          mkdir -p "$(dirname "$skill_file")"
           status=$(curl -sS -w '%{http_code}' -H "Authorization: Bearer $token" \
-            "$VERY_BOT_URL/skills/very-engineering/very-code-review" \
-            -o "$HOME/.claude/skills/very-code-review/SKILL.md")
+            "$VERY_BOT_URL/skills/very-engineering/very-code-review" -o "$skill_file")
           case "$status" in
             200) ;;
             429)
@@ -69,11 +80,80 @@ jobs:
               echo "::error::very-bot refused the review (HTTP $status). Ask your Very engineer to check this org's setup."
               exit 1 ;;
           esac
+          # A skill's allowed-tools frontmatter outranks --allowedTools; drop it (and any
+          # indented list under it) so the review stays read-only, and fail if it survives.
+          awk 'NR == 1 && /^---$/ { fm = 1; print; next }
+               fm && /^---$/ { fm = 0 }
+               fm && /^allowed-tools:/ { skip = 1; next }
+               skip && /^[[:space:]]/ { next }
+               { skip = 0; print }' "$skill_file" > "$skill_file.tmp"
+          mv "$skill_file.tmp" "$skill_file"
+          if awk 'NR > 1 && /^---$/ { exit } /^allowed-tools:/ { found = 1 } END { exit !found }' "$skill_file"; then
+            echo "::error::Couldn't remove the skill's allowed-tools."
+            exit 1
+          fi
 
       - run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
+      # The model never calls GitHub: the workflow gathers what the skill reads.
+      - name: Gather the PR for the review
+        id: gather
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/bundle"
+          mkdir -p "$bundle"
+          gh pr view "$PR" --json number,url,state,isDraft,headRefOid,baseRefName,author,title,files \
+            > "$bundle/pr.json"
+          # The skill's eligibility rule: closed, draft and bot-authored PRs get no review.
+          if ! jq -e '.state == "OPEN" and (.isDraft | not) and ((.author.is_bot // false) | not)' \
+              "$bundle/pr.json" > /dev/null; then
+            echo "::notice::very-bot doesn't review closed, draft or bot-authored PRs."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # GitHub refuses diffs over 300 files or 20,000 lines; the checkout has full history.
+          gh pr diff "$PR" > "$bundle/diff.patch" || git diff "origin/$BASE...HEAD" > "$bundle/diff.patch"
+          gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq '.[]' | jq -s . > "$bundle/reviews.json"
+          gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[]' | jq -s . > "$bundle/comments.json"
+          gh api graphql -F owner="${REPO%/*}" -F repo="${REPO#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) { pullRequest(number: $pr) {
+                reviewThreads(first: 100) { nodes { id isResolved path line
+                  comments(first: 20) { nodes { url body author { login } } } } } } } }' \
+            --jq '.data.repository.pullRequest.reviewThreads.nodes' > "$bundle/threads.json"
+          # Recent merged PRs' review comments, for the history angle.
+          gh pr list --state merged --limit 10 --json number --jq '.[].number' \
+            | while read -r n; do
+                gh api "repos/$REPO/pulls/$n/comments" --paginate \
+                  --jq ".[] | {pr: $n, path, body}"
+              done | jq -s . > "$bundle/history.json"
+          # Git history for the skill, which gets no git or shell in CI.
+          mkdir -p "$bundle/git"
+          git log --oneline -30 > "$bundle/git/log.txt"
+          jq -r '.files[].path' "$bundle/pr.json" | head -50 | while read -r f; do
+            name=$(printf '%s' "$f" | tr '/' '_')
+            git log --oneline -15 -- "$f" > "$bundle/git/$name.log" || true
+            git log -p -3 --format='commit %h %s' -- "$f" | head -c 100000 > "$bundle/git/$name.patches" || true
+            if [ -f "$f" ]; then git blame -w --date=short -- "$f" > "$bundle/git/$name.blame" || true; fi
+          done
+          # A re-review covers only what changed since the last reviewed commit (Step 2.5).
+          last=$(jq -rs 'add | map({t: (.submitted_at // .created_at // ""), b: (.body // "")})
+              | sort_by(.t) | .[].b' "$bundle/reviews.json" "$bundle/comments.json" \
+            | grep -oE '_very-code-review · cycle [^_]*· [0-9a-f]{7,40}_' | tail -1 \
+            | grep -oE '[0-9a-f]{7,40}_$' | tr -d _ || true)
+          if [ -n "$last" ] && git cat-file -e "$last^{commit}" 2>/dev/null; then
+            git diff "$last...$(jq -r .headRefOid "$bundle/pr.json")" > "$bundle/delta.patch" \
+              || rm -f "$bundle/delta.patch"
+          fi
+
       - name: Review
         id: review
+        if: steps.gather.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -86,38 +166,76 @@ jobs:
           set -euo pipefail
           date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
           date +%s > "$RUNNER_TEMP/started_epoch"
-          # Post as very-bot with a token for this repo alone; github.token posts as github-actions.
-          id_token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
-          echo "::add-mask::$id_token"
-          if bot_token=$(curl -sS --fail -X POST -H "Authorization: Bearer $id_token" \
-              "$VERY_BOT_URL/github-token" | jq -er .token); then
-            echo "::add-mask::$bot_token"
-            export GH_TOKEN="$bot_token"
+
+          # Claude runs as a fresh user of its own, so nothing a PR tricks it into can reach
+          # this user's environment (the OIDC credentials) or files. Without sudo (some
+          # self-hosted runners) it shares ours, still with no shell and no writes.
+          if sudo -n true 2>/dev/null; then
+            sudo pkill -KILL -u very-bot-model 2>/dev/null || true
+            sudo userdel -r -f very-bot-model 2>/dev/null || true
+            sudo useradd --create-home very-bot-model
+            model_home=/home/very-bot-model
+            as_model() { sudo -u very-bot-model "$@"; }
+            # Root reads our files and leaves read-only copies the model can't change.
+            put() { sudo install -D -o root -g root -m 644 "$1" "$2"; }
           else
-            echo "::warning::Couldn't get very-bot's token; this review posts as github-actions."
+            echo "::warning::No passwordless sudo on this runner; the review runs as the runner user."
+            model_home="$RUNNER_TEMP/model-home"
+            as_model() { "$@"; }
+            put() { install -D -m 644 "$1" "$2"; }
           fi
-          # Any static credential silently outranks workload identity.
+          as_model mkdir -p "$model_home/.claude" "$model_home/repo" "$model_home/bundle"
+          put "$RUNNER_TEMP/very-code-review/SKILL.md" "$model_home/.claude/skills/very-code-review/SKILL.md"
+          echo '{}' > "$RUNNER_TEMP/settings.json"
+          put "$RUNNER_TEMP/settings.json" "$model_home/.claude/settings.json"
+          tar -C . -cf - . | as_model tar -C "$model_home/repo" -xf -
+          tar -C "$RUNNER_TEMP/bundle" -cf - . | as_model tar -C "$model_home/bundle" -xf -
+
+          # The model's user works only from its own copies; it can't list the runner's temp dir.
+          chmod 700 "$RUNNER_TEMP"
+
+          # The Anthropic JWT is the one credential the model's user can read; it lives ~5
+          # minutes. Any static credential silently outranks workload identity.
           unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-          export ANTHROPIC_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/gha-jwt"
+          jwt_dir=$(mktemp -d)
+          chmod 755 "$jwt_dir"
+          jwt="$jwt_dir/gha-jwt"
           fetch_jwt() {
             curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" \
-              | jq -r .value > "$ANTHROPIC_IDENTITY_TOKEN_FILE.tmp"
-            mv "$ANTHROPIC_IDENTITY_TOKEN_FILE.tmp" "$ANTHROPIC_IDENTITY_TOKEN_FILE"
+              | jq -r .value > "$jwt.tmp"
+            chmod 644 "$jwt.tmp"
+            mv "$jwt.tmp" "$jwt"
           }
           # GitHub OIDC tokens are single-use and expire in ~5 minutes; Claude Code
           # re-exchanges mid-run, so keep a fresh one on disk.
           fetch_jwt
           (while sleep 240; do fetch_jwt; done) &
 
-          # The full transcript is uploaded below, so slow or wrong reviews can be traced.
-          # No scheduling: claude -p waits for a scheduled wakeup before exiting, which left
-          # runs idle ~17 minutes after posting. Subagents report back without one.
-          claude -p "/very-code-review $PR_URL" \
+          schema='{"type": "object", "required": ["action"], "properties": {
+            "action": {"enum": ["review", "cap", "noop"]},
+            "body": {"type": "string"},
+            "comments": {"type": "array", "items": {"type": "object",
+              "required": ["path", "line", "body"], "properties": {
+                "path": {"type": "string"}, "line": {"type": "integer"},
+                "body": {"type": "string"}}}},
+            "resolve": {"type": "array", "items": {"type": "string"}}}}'
+
+          # The model only reads: no shell, git, gh, token or writes. The PR's .claude/ and
+          # .mcp.json never configure Claude Code. No scheduling: claude -p waits for it.
+          as_model env -i HOME="$model_home" PATH="$PATH" \
+            ANTHROPIC_FEDERATION_RULE_ID="$ANTHROPIC_FEDERATION_RULE_ID" \
+            ANTHROPIC_ORGANIZATION_ID="$ANTHROPIC_ORGANIZATION_ID" \
+            ANTHROPIC_SERVICE_ACCOUNT_ID="$ANTHROPIC_SERVICE_ACCOUNT_ID" \
+            ANTHROPIC_WORKSPACE_ID="$ANTHROPIC_WORKSPACE_ID" \
+            ANTHROPIC_IDENTITY_TOKEN_FILE="$jwt" \
+            bash -c 'cd "$1/repo" && shift && exec claude "$@"' _ "$model_home" \
+            -p "/very-code-review --ci $model_home/bundle $PR_URL" \
             --model "$MODEL" --output-format stream-json --verbose \
-            --allowedTools "Bash(gh:*)" "Bash(git:*)" "Bash(jq:*)" Read Glob Grep Agent Task Skill \
-            --disallowedTools ScheduleWakeup CronCreate \
+            --setting-sources user --strict-mcp-config --json-schema "$schema" \
+            --allowedTools Read Glob Grep Agent Task Skill \
+            --disallowedTools ScheduleWakeup CronCreate Bash Write Edit NotebookEdit \
+              "Read(/$jwt*)" "Read(//proc/**)" \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
             > "$RUNNER_TEMP/result.json"
@@ -130,6 +248,118 @@ jobs:
             fi
             exit 1
           fi
+          jq -e '.structured_output // empty' "$RUNNER_TEMP/result.json" > "$RUNNER_TEMP/review.json"
+
+      # After the review, so very-bot's token never enters the model's step.
+      - name: Use very-bot's token for this repo
+        if: always()
+        env:
+          FALLBACK: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Posts appear as very-bot; github.token posts as github-actions.
+          id_token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$id_token"
+          if bot_token=$(curl -sS --fail -X POST -H "Authorization: Bearer $id_token" \
+              "$VERY_BOT_URL/github-token" | jq -er .token); then
+            echo "::add-mask::$bot_token"
+            echo "GH_TOKEN=$bot_token" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Couldn't get very-bot's token; this review posts as github-actions."
+            echo "GH_TOKEN=$FALLBACK" >> "$GITHUB_ENV"
+          fi
+
+      - name: Post the review
+        if: steps.review.outcome == 'success'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 -I - "$RUNNER_TEMP/review.json" <<'PY'
+          import json, os, re, sys, urllib.error, urllib.request
+
+          review = json.load(open(sys.argv[1]))
+          bundle = os.environ["RUNNER_TEMP"] + "/bundle"
+          repo, pr = os.environ["REPO"], os.environ["PR"]
+          # The model can't reach our tokens, but never post anything shaped like one.
+          TOKEN = re.compile(r"eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}|gh[pousr]_\w{20,}|github_pat_\w{20,}")
+          MARKER = "_very-code-review"
+
+          def clean(text):
+              return TOKEN.sub("[redacted]", text)
+
+          def above_marker(body, text):
+              at = body.rfind(MARKER)
+              return f"{body[:at]}{text}\n\n{body[at:]}" if at >= 0 else f"{body}\n\n{text}"
+
+          def anchorable(patch):
+              """The new-side lines in each file's hunks: the only lines GitHub anchors to."""
+              lines, path, n = {}, None, 0
+              for row in patch.splitlines():
+                  if row.startswith("diff --git"):
+                      path = None
+                  elif row.startswith("+++ "):
+                      path = row[6:] if row.startswith("+++ b/") else None
+                  elif row.startswith("@@"):
+                      n = int(re.match(r"@@ -\S+ \+(\d+)", row).group(1))
+                  elif path and row[:1] in ("+", " "):
+                      lines.setdefault(path, set()).add(n)
+                      n += 1
+              return lines
+
+          def as_list(comments):
+              return "\n".join(f"- `{c['path']}:{c['line']}` {c['body']}" for c in comments)
+
+          def github(method, path, body):
+              req = urllib.request.Request(
+                  os.environ["GITHUB_API_URL"] + path, method=method, data=json.dumps(body).encode(),
+                  headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                           "Accept": "application/vnd.github+json"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          action = review["action"]
+          if action == "noop":
+              print("Nothing to post.")
+              sys.exit(0)
+          if not review.get("body"):
+              sys.exit(f"::error::The review returned {action} without a body.")
+          if action == "cap":
+              github("POST", f"/repos/{repo}/issues/{pr}/comments", {"body": clean(review["body"])})
+              sys.exit(0)
+
+          threads = {t["id"]: t for t in json.load(open(f"{bundle}/threads.json"))}
+          unresolved = []
+          for thread_id in review.get("resolve", []):
+              if thread_id not in threads:
+                  continue  # only threads that exist on this PR
+              query = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"
+              result = github("POST", "/graphql", {"query": query, "variables": {"id": thread_id}})
+              if result.get("errors"):
+                  unresolved.append(threads[thread_id]["comments"]["nodes"][0]["url"])
+          body = clean(review["body"])
+          if unresolved:
+              body = above_marker(body, "Fixed, but I couldn't resolve these threads; resolve them by hand:\n" + "\n".join(unresolved))
+
+          # A line outside the diff makes GitHub reject the whole review, so move just those.
+          anchors = anchorable(open(f"{bundle}/diff.patch", errors="replace").read())
+          inline, moved = [], []
+          for c in review.get("comments", []):
+              comment = {"path": c["path"], "line": c["line"], "side": "RIGHT", "body": clean(c["body"])}
+              (inline if c["line"] in anchors.get(c["path"], ()) else moved).append(comment)
+          if moved:
+              body = above_marker(body, as_list(moved))
+          head = json.load(open(f"{bundle}/pr.json"))["headRefOid"]
+          payload = {"commit_id": head, "event": "COMMENT", "body": body, "comments": inline}
+          try:
+              github("POST", f"/repos/{repo}/pulls/{pr}/reviews", payload)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 422 or not inline:
+                  raise
+              payload |= {"comments": [], "body": above_marker(body, as_list(inline))}
+              github("POST", f"/repos/{repo}/pulls/{pr}/reviews", payload)
+          PY
 
       - name: Report the run to very-bot
         if: always() && steps.review.outcome != 'skipped'
@@ -153,6 +383,14 @@ jobs:
               -H "content-type: application/json" --data @- "$VERY_BOT_URL/runs" \
             || echo "::warning::Couldn't report this run to very-bot; the review itself is unaffected."
 
+      - name: Redact tokens from the transcript
+        if: always()
+        run: |
+          t="$RUNNER_TEMP/transcript.jsonl"
+          [ -f "$t" ] || exit 0
+          sed -E -i 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/[redacted]/g' "$t" \
+            || rm -f "$t"
+
       - name: Upload the review transcript
         if: always()
         uses: actions/upload-artifact@v7
@@ -167,3 +405,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr edit "${{ github.event.pull_request.number }}" --remove-label very-review || true
+
+      - name: Remove the model's user
+        if: always()
+        run: |
+          sudo -n pkill -KILL -u very-bot-model 2>/dev/null || true
+          sudo -n userdel -r -f very-bot-model 2>/dev/null || true

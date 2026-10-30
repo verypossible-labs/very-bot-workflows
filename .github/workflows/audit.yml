@@ -1,0 +1,400 @@
+name: very-bot audit
+
+# Reusable workflow called from a client repo when very-bot labels its own `very-audit`
+# issue (an engineer pressed Start audit in Argus). Runs an `*-init` skill's audit,
+# report-only, entirely on the caller's runner (very-bot ADR 0001, Decision 2).
+
+on:
+  workflow_call:
+    inputs:
+      federation-rule-id:
+        description: Anthropic WIF rule for the client's workspace (fdrl_…)
+        type: string
+        required: true
+      organization-id:
+        description: Very's Anthropic organization ID
+        type: string
+        required: true
+      service-account-id:
+        description: Anthropic service account for the client's workspace (svac_…)
+        type: string
+        required: true
+      workspace-id:
+        description: The client's Anthropic workspace (wrkspc_…)
+        type: string
+        required: true
+      model:
+        type: string
+        default: claude-opus-5-5
+
+env:
+  CLAUDE_CODE_VERSION: 2.1.312
+  VERY_BOT_URL: https://eer3g3paoq2q2buc2slrkgdtye0wzhzs.lambda-url.us-west-2.on.aws
+
+jobs:
+  audit:
+    # Only very-bot labelling its own issue starts an audit, so nobody in the client org
+    # can spend Very's tokens here; audits have no monthly cap for that reason. A re-run
+    # replays the event but changes triggering_actor, so it doesn't pass.
+    if: >-
+      github.event.label.name == 'very-audit'
+      && github.event.sender.login == 'very-bot[bot]'
+      && github.event.issue.user.login == 'very-bot[bot]'
+      && github.triggering_actor == 'very-bot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: very-audit-${{ github.repository }}-${{ github.event.issue.number }}
+    env:
+      ISSUE: ${{ github.event.issue.number }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the very-bot org variables
+        env:
+          IDS: >-
+            ${{ inputs.federation-rule-id }} ${{ inputs.organization-id }}
+            ${{ inputs.service-account-id }} ${{ inputs.workspace-id }}
+        run: |
+          if [ "$(wc -w <<<"$IDS")" -ne 4 ]; then
+            echo "::error::Set the VERY_BOT_* org variables (Settings → Secrets and variables → Actions → Variables) and share them with this repo."
+            exit 1
+          fi
+
+      - name: Fetch Very's audit skill and client context
+        id: fetch
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          skill=$(grep -oE 'very-audit skill=very-[a-z0-9-]+-init' <<<"$ISSUE_BODY" | head -1 | cut -d= -f2 || true)
+          if [ -z "$skill" ]; then
+            echo "::error::This issue doesn't name an audit skill."
+            exit 1
+          fi
+          echo "skill=$skill" >> "$GITHUB_OUTPUT"
+          # very-bot checks this token belongs to very-bot-workflows in an active client org.
+          token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$token"
+          fetch() {
+            status=$(curl -sS -w '%{http_code}' -H "Authorization: Bearer $token" "$VERY_BOT_URL$1" -o "$2")
+            case "$status" in
+              200) ;;
+              404) echo "::error::very-bot has no $1 for this repo. Ask your Very engineer to add the repo to its System in Argus."; exit 1 ;;
+              503) echo "::error::very-bot couldn't confirm this repo with Very right now. Ask your Very engineer to start the audit again."; exit 1 ;;
+              *) echo "::error::very-bot refused $1 (HTTP $status). Ask your Very engineer to check this org's setup."; exit 1 ;;
+            esac
+          }
+          skill_file="$RUNNER_TEMP/skill/SKILL.md"
+          mkdir -p "$(dirname "$skill_file")"
+          fetch "/skills/very-engineering/$skill" "$skill_file"
+          # A skill's allowed-tools frontmatter outranks --allowedTools; drop it (and any
+          # indented list under it) so the audit stays read-only, and fail if it survives.
+          awk 'NR == 1 && /^---$/ { fm = 1; print; next }
+               fm && /^---$/ { fm = 0 }
+               fm && /^allowed-tools:/ { skip = 1; next }
+               skip && /^[[:space:]]/ { next }
+               { skip = 0; print }' "$skill_file" > "$skill_file.tmp"
+          mv "$skill_file.tmp" "$skill_file"
+          if awk 'NR > 1 && /^---$/ { exit } /^allowed-tools:/ { found = 1 } END { exit !found }' "$skill_file"; then
+            echo "::error::Couldn't remove the skill's allowed-tools."
+            exit 1
+          fi
+          # Never echoed: it holds the client's AWS account IDs.
+          fetch /context "$RUNNER_TEMP/client-context.yaml"
+
+      - run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+
+      - name: Audit
+        id: audit
+        env:
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation-rule-id }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization-id }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service-account-id }}
+          ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace-id }}
+          MODEL: ${{ inputs.model }}
+          SKILL: ${{ steps.fetch.outputs.skill }}
+        run: |
+          set -euo pipefail
+          date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
+          date +%s > "$RUNNER_TEMP/started_epoch"
+          # Claude runs as a fresh user of its own, so nothing the repo tricks it into can
+          # reach this user's environment (the OIDC credentials) or files. Without sudo (some
+          # self-hosted runners) it shares ours, still with no writes and only ls.
+          if sudo -n true 2>/dev/null; then
+            sudo pkill -KILL -u very-bot-model 2>/dev/null || true
+            sudo userdel -r -f very-bot-model 2>/dev/null || true
+            sudo useradd --create-home very-bot-model
+            model_home=/home/very-bot-model
+            as_model() { sudo -u very-bot-model "$@"; }
+            # Root reads our files and leaves read-only copies the model can't change.
+            put() { sudo install -D -o root -g root -m 644 "$1" "$2"; }
+          else
+            echo "::warning::No passwordless sudo on this runner; the audit runs as the runner user."
+            model_home="$RUNNER_TEMP/model-home"
+            as_model() { "$@"; }
+            put() { install -D -m 644 "$1" "$2"; }
+          fi
+          as_model mkdir -p "$model_home/.claude" "$model_home/repo"
+          put "$RUNNER_TEMP/skill/SKILL.md" "$model_home/.claude/skills/$SKILL/SKILL.md"
+          put "$RUNNER_TEMP/client-context.yaml" "$model_home/context/client-context.yaml"
+          echo '{}' > "$RUNNER_TEMP/settings.json"
+          put "$RUNNER_TEMP/settings.json" "$model_home/.claude/settings.json"
+          tar -C . -cf - . | as_model tar -C "$model_home/repo" -xf -
+
+          # The model's user works only from its own copies; it can't list the runner's temp dir.
+          chmod 700 "$RUNNER_TEMP"
+
+          # The Anthropic JWT is the one credential the model's user can read; it lives ~5
+          # minutes. Any static credential silently outranks workload identity.
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+          jwt_dir=$(mktemp -d)
+          chmod 755 "$jwt_dir"
+          jwt="$jwt_dir/gha-jwt"
+          fetch_jwt() {
+            curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" \
+              | jq -r .value > "$jwt.tmp"
+            chmod 644 "$jwt.tmp"
+            mv "$jwt.tmp" "$jwt"
+          }
+          # GitHub OIDC tokens expire in ~5 minutes; Claude Code re-exchanges mid-run.
+          fetch_jwt
+          (while sleep 240; do fetch_jwt; done) &
+
+          # The CI audit rules live here, once, rather than in every skill.
+          findings="$RUNNER_TEMP/findings.json"
+          prompt="/$SKILL audit
+
+          This is an unattended CI audit of this repository. Rules:
+          - Run only the skill's audit / drift step and report every row of its checklist.
+            Ask nothing and change no file in the repository.
+          - The client context is the YAML file $model_home/context/client-context.yaml. Read it
+            from there; never call very-mcp or look for .claude/very-client-context.yaml.
+          - A row that needs GitHub settings (environments, secrets, rulesets, reviewers),
+            AWS, a console, or running the app is not_checked, with the reason as its
+            detail. Never guess.
+          - You can't write files or run commands. Return the findings as the structured
+            output: {\"checks\": [{\"id\": \"<the row's ID, verbatim>\",
+              \"check\": \"<the row's check text, verbatim, at most 200 characters>\",
+              \"status\": \"pass\" | \"fail\" | \"not_checked\",
+              \"detail\": \"<what's wrong, or why not checked>\",
+              \"file\": \"<repo-relative path, when one applies>\"}]}
+            with one entry per row, in the skill's order.
+          - detail is plain prose of at most 500 characters. Never quote code, config
+            values, secrets or identifiers from the repository in it: it leaves this
+            repository. Say what is wrong, not what the file contains.
+          - file is relative to the repository root (no leading / and no ..), at most
+            300 characters."
+
+          schema='{"type": "object", "required": ["checks"], "properties": {"checks": {
+            "type": "array", "minItems": 1, "maxItems": 200, "items": {
+              "type": "object", "required": ["id", "check", "status"], "properties": {
+                "id": {"type": "string"}, "check": {"type": "string", "maxLength": 200},
+                "status": {"enum": ["pass", "fail", "not_checked"]},
+                "detail": {"type": "string", "maxLength": 500},
+                "file": {"type": "string", "maxLength": 300}}}}}}'
+
+          # The model reads untrusted files, so it only reads: no writes, no commands beyond
+          # ls, no Anthropic JWT. The repo's own .claude/ and .mcp.json never configure
+          # Claude Code (hooks and MCP servers would run code here), but stay for the audit.
+          as_model env -i HOME="$model_home" PATH="$PATH" \
+            ANTHROPIC_FEDERATION_RULE_ID="$ANTHROPIC_FEDERATION_RULE_ID" \
+            ANTHROPIC_ORGANIZATION_ID="$ANTHROPIC_ORGANIZATION_ID" \
+            ANTHROPIC_SERVICE_ACCOUNT_ID="$ANTHROPIC_SERVICE_ACCOUNT_ID" \
+            ANTHROPIC_WORKSPACE_ID="$ANTHROPIC_WORKSPACE_ID" \
+            ANTHROPIC_IDENTITY_TOKEN_FILE="$jwt" \
+            bash -c 'cd "$1/repo" && shift && exec claude "$@"' _ "$model_home" \
+            -p "$prompt" \
+            --model "$MODEL" --output-format stream-json --verbose \
+            --setting-sources user --strict-mcp-config --json-schema "$schema" \
+            --allowedTools Read Glob Grep "Bash(ls:*)" Agent Task Skill \
+            --disallowedTools ScheduleWakeup CronCreate Write Edit NotebookEdit \
+              "Read(/$jwt*)" "Read(//proc/**)" \
+            > "$RUNNER_TEMP/transcript.jsonl" || true
+          jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
+            > "$RUNNER_TEMP/result.json"
+          jq '{is_error, num_turns, total_cost_usd, duration_ms}' "$RUNNER_TEMP/result.json"
+          # --json-schema validates the findings before Claude Code returns them.
+          jq -e '.structured_output // empty' "$RUNNER_TEMP/result.json" > "$findings" \
+            || rm -f "$findings"
+
+          if ! jq -e '.is_error == false' "$RUNNER_TEMP/result.json" > /dev/null \
+              || ! jq -e '.checks | type == "array" and length > 0' "$findings" > /dev/null 2>&1; then
+            echo "::error::The audit didn't finish or wrote no findings; see the transcript artifact."
+            exit 1
+          fi
+
+      # After the audit, so very-bot's token never enters the audit's processes.
+      - name: Use very-bot's token for this repo
+        if: always()
+        env:
+          FALLBACK: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Comments post as very-bot; github.token posts as github-actions.
+          id_token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$id_token"
+          if bot_token=$(curl -sS --fail -X POST -H "Authorization: Bearer $id_token" \
+              "$VERY_BOT_URL/github-token" | jq -er .token); then
+            echo "::add-mask::$bot_token"
+            echo "GH_TOKEN=$bot_token" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Couldn't get very-bot's token; this audit posts as github-actions."
+            echo "GH_TOKEN=$FALLBACK" >> "$GITHUB_ENV"
+          fi
+
+      - name: Send the findings to very-bot and post them on the issue
+        env:
+          SKILL: ${{ steps.fetch.outputs.skill }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$token"
+          # Argus applies accepted drift and answers with the final statuses.
+          status=$(jq -c --arg skill "$SKILL" --argjson issue "$ISSUE" \
+              '{skill: $skill, issue: $issue, checks: .checks}' "$RUNNER_TEMP/findings.json" \
+            | curl -sS -w '%{http_code}' -X POST -H "Authorization: Bearer $token" \
+              -H "content-type: application/json" --data @- "$VERY_BOT_URL/audits" \
+              -o "$RUNNER_TEMP/final.json") || true
+          case "$status" in
+            200) ;;
+            409)
+              # A newer audit replaced this one; very-bot already closed this issue saying so.
+              echo "::notice::$(cat "$RUNNER_TEMP/final.json"); not posting these findings."
+              exit 0 ;;
+            *)
+              echo "::warning::Couldn't record the findings with Very (HTTP $status); posting them without accepted drift."
+              cp "$RUNNER_TEMP/findings.json" "$RUNNER_TEMP/final.json" ;;
+          esac
+
+          jq -r --arg skill "$SKILL" --arg run "$RUN_URL" --arg sha "${GITHUB_SHA:0:7}" '
+            def count(s): [.checks[] | select(.status == s)] | length;
+            def item: "- **\(.check)**"
+              + (if (.detail // "") != "" then ": \(.detail)" else "" end)
+              + (if (.file // "") != "" then " (`\(.file)`)" else "" end);
+            def section(s; title):
+              if count(s) > 0
+              then ("<details><summary>\(title) (\(count(s)))</summary>", "",
+                    (.checks[] | select(.status == s) | item
+                      + (if .reason then " — accepted: \(.reason)" else "" end)),
+                    "", "</details>", "")
+              else empty end;
+            "### very-bot audit: `\($skill)`",
+            "",
+            (if count("fail") > 0 then "**\(count("fail")) failing.**"
+             elif count("pass") > 0 then "**No failing checks.**"
+             else "**Nothing could be checked.**" end)
+              + " \(count("pass")) passing, \(count("accepted")) accepted drift, \(count("not_checked")) not checked.",
+            "",
+            (if count("fail") > 0
+             then ("#### Failing", "", (.checks[] | select(.status == "fail") | item), "")
+             else empty end),
+            section("accepted"; "Accepted drift"),
+            section("not_checked"; "Not checked"),
+            "_\($sha) · [run](\($run))_"
+          ' "$RUNNER_TEMP/final.json" > "$RUNNER_TEMP/comment.md"
+          gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/comment.md"
+
+          if jq -e '[.checks[] | select(.status == "fail")] | length == 0' "$RUNNER_TEMP/final.json" > /dev/null; then
+            gh issue close "$ISSUE" --reason completed
+          fi
+
+      - name: Say the audit couldn't finish
+        if: failure() || cancelled()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FALLBACK: ${{ github.token }}
+        run: |
+          GH_TOKEN="${GH_TOKEN:-$FALLBACK}" gh issue comment "$ISSUE" \
+            --body "very-bot couldn't finish this audit ([run]($RUN_URL)). Ask your Very engineer to start it again." || true
+
+      - name: Report the run to very-bot
+        if: always() && steps.audit.outcome != 'skipped'
+        run: |
+          set -uo pipefail
+          # Numbers only, no code. Who ran it and where comes from the signed token.
+          [ -s "$RUNNER_TEMP/result.json" ] || exit 0
+          token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$token"
+          jq -n --slurpfile r "$RUNNER_TEMP/result.json" \
+            --arg started "$(cat "$RUNNER_TEMP/started_at")" \
+            --argjson ms "$(( ($(date +%s) - $(cat "$RUNNER_TEMP/started_epoch")) * 1000 ))" \
+            '{started_at: $started, duration_ms: $ms,
+              num_turns: $r[0].num_turns, cost_usd: $r[0].total_cost_usd, is_error: $r[0].is_error}' \
+            | curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" \
+              -H "content-type: application/json" --data @- "$VERY_BOT_URL/runs" \
+            || echo "::warning::Couldn't report this run to very-bot; the audit itself is unaffected."
+
+      # The client context must not be downloadable: drop every tool output, and redact its
+      # values wherever the model quoted them. If that fails, upload nothing.
+      - name: Strip the client context from the transcript
+        if: always()
+        run: |
+          t="$RUNNER_TEMP/transcript.jsonl"
+          [ -f "$t" ] || exit 0
+          # -I: never import from the checkout, where a json.py or re.py would shadow stdlib.
+          python3 -I - "$t" "$RUNNER_TEMP/client-context.yaml" <<'PY' || rm -f "$t"
+          import json, os, re, sys
+
+          transcript, context = sys.argv[1], sys.argv[2]
+          text = open(context, errors="replace").read() if os.path.exists(context) else ""
+          pieces = []
+          for line in text.splitlines():
+              # Each whole value, without its key, list dash, inline comment or [a, b] brackets.
+              value = re.sub(r"^\s*(-\s+)?([\w.-]+:\s*)?", "", line)
+              value = re.sub(r"(^|\s+)#.*$", "", value).strip()
+              pieces += [value, *value.strip("[]").split(",")] if value.startswith("[") else [value]
+          for token in re.findall(r"[\w.:/@+-]+", text):
+              # Each token and its parts, so an account ID inside an ARN, a URL's host or an
+              # org/repo is caught when quoted alone.
+              pieces += [token, *re.split(r"[:/@]+", token)]
+          # Public hosts stay readable; they say nothing about the client.
+          public = {"github.com", "api.github.com", "gitlab.com", "amazonaws.com"}
+          values = set()
+          for piece in pieces:
+              piece = piece.strip(" '\":.,-[]").removesuffix(".git")
+              # IDs, ARNs, domains and slugs; plain words like "pulumi" stay readable.
+              if len(piece) >= 6 and re.search(r"[\d./:@_-]", piece) and piece not in public:
+                  values.add(piece)
+          values = sorted(values, key=len, reverse=True)
+
+          def scrub(node):
+              if isinstance(node, dict):
+                  return {
+                      key: "[omitted]" if key == "content" and node.get("type") == "tool_result"
+                      else scrub(item)
+                      for key, item in node.items()
+                      if key != "tool_use_result"
+                  }
+              if isinstance(node, list):
+                  return [scrub(item) for item in node]
+              if isinstance(node, str):
+                  for value in values:
+                      node = node.replace(value, "[redacted]")
+              return node
+
+          lines = [json.dumps(scrub(json.loads(line))) for line in open(transcript) if line.strip()]
+          with open(transcript, "w") as out:
+              out.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload the audit transcript
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: very-audit-transcript-${{ github.event.issue.number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/transcript.jsonl
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Remove the model's user
+        if: always()
+        run: |
+          sudo -n pkill -KILL -u very-bot-model 2>/dev/null || true
+          sudo -n userdel -r -f very-bot-model 2>/dev/null || true
