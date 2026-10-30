@@ -27,9 +27,10 @@ They're public so your repositories can call them; nothing else about very-bot l
 
 ## Where your code goes
 
-Reviews and audits run on **your** runners. When AI is used, your code is sent to
-Anthropic's API, under a short-lived credential scoped to your organization, and to no Very
-system. Very receives only the findings. No API key is ever stored in your repositories.
+Reviews and audits run on **your** runners. When AI is used, your code is sent only to the
+AI provider agreed with you for your organization, under a short-lived credential scoped
+to your organization, and to no Very system. Very receives only the findings. No API key
+is ever stored in your repositories.
 
 You can uninstall very-bot at any time from your organization's settings.
 
