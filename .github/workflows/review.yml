@@ -43,20 +43,37 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch Very's review skill
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           set -euo pipefail
-          # very-bot checks this token belongs to very-bot-workflows in an active client org.
+          # very-bot checks this token belongs to very-bot-workflows in an active client org,
+          # and that the client's monthly review budget isn't used up.
           token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
           echo "::add-mask::$token"
           mkdir -p "$HOME/.claude/skills/very-code-review"
-          curl -sS --fail-with-body -H "Authorization: Bearer $token" \
+          status=$(curl -sS -w '%{http_code}' -H "Authorization: Bearer $token" \
             "$VERY_BOT_URL/skills/very-engineering/very-code-review" \
-            -o "$HOME/.claude/skills/very-code-review/SKILL.md"
+            -o "$HOME/.claude/skills/very-code-review/SKILL.md")
+          case "$status" in
+            200) ;;
+            429)
+              gh pr comment "$PR_URL" --body "very-bot couldn't review this PR: this month's review budget is used up. Ask your Very engineer to raise it."
+              exit 1 ;;
+            503)
+              echo "::error::very-bot couldn't confirm this repo with Very right now. Add the label again in a few minutes."
+              exit 1 ;;
+            *)
+              echo "::error::very-bot refused the review (HTTP $status). Ask your Very engineer to check this org's setup."
+              exit 1 ;;
+          esac
 
       - run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
       - name: Review
+        id: review
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -67,6 +84,8 @@ jobs:
           MODEL: ${{ inputs.model }}
         run: |
           set -euo pipefail
+          date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
+          date +%s > "$RUNNER_TEMP/started_epoch"
           # Any static credential silently outranks workload identity.
           unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
           export ANTHROPIC_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/gha-jwt"
@@ -100,6 +119,28 @@ jobs:
             fi
             exit 1
           fi
+
+      - name: Report the run to very-bot
+        if: always() && steps.review.outcome != 'skipped'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -uo pipefail
+          # Numbers only, no code. Who ran it and where comes from the signed token.
+          [ -s "$RUNNER_TEMP/result.json" ] || exit 0
+          token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$token"
+          jq -n --slurpfile r "$RUNNER_TEMP/result.json" \
+            --argjson pr "$PR" --arg author "$PR_AUTHOR" \
+            --arg started "$(cat "$RUNNER_TEMP/started_at")" \
+            --argjson ms "$(( ($(date +%s) - $(cat "$RUNNER_TEMP/started_epoch")) * 1000 ))" \
+            '{pr: $pr, pr_author: $author, started_at: $started, duration_ms: $ms,
+              num_turns: $r[0].num_turns, cost_usd: $r[0].total_cost_usd, is_error: $r[0].is_error}' \
+            | curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" \
+              -H "content-type: application/json" --data @- "$VERY_BOT_URL/runs" \
+            || echo "::warning::Couldn't report this run to very-bot; the review itself is unaffected."
 
       - name: Upload the review transcript
         if: always()
