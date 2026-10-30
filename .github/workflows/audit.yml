@@ -263,16 +263,44 @@ jobs:
               -H "content-type: application/json" --data @- "$VERY_BOT_URL/runs" \
             || echo "::warning::Couldn't report this run to very-bot; the audit itself is unaffected."
 
-      # Tool results go: they include the client context, which must not be downloadable.
-      - name: Strip tool results from the transcript
+      # The client context must not be downloadable: drop every tool output, and redact its
+      # values wherever the model quoted them. If that fails, upload nothing.
+      - name: Strip the client context from the transcript
         if: always()
         run: |
-          [ -f "$RUNNER_TEMP/transcript.jsonl" ] || exit 0
-          jq -c 'if .type == "user" and (.message.content | type) == "array"
-                 then .message.content |= map(if .type == "tool_result" then .content = "[omitted]" else . end)
-                 else . end' "$RUNNER_TEMP/transcript.jsonl" > "$RUNNER_TEMP/transcript.stripped.jsonl" \
-            && mv "$RUNNER_TEMP/transcript.stripped.jsonl" "$RUNNER_TEMP/transcript.jsonl" \
-            || rm -f "$RUNNER_TEMP/transcript.jsonl"
+          t="$RUNNER_TEMP/transcript.jsonl"
+          [ -f "$t" ] || exit 0
+          python3 - "$t" "$RUNNER_TEMP/client-context.yaml" <<'PY' || rm -f "$t"
+          import json, os, re, sys
+
+          transcript, context = sys.argv[1], sys.argv[2]
+          values = set()
+          if os.path.exists(context):
+              for line in open(context):
+                  value = re.sub(r"^\s*(-\s+)?([\w.-]+:\s*)?", "", line).strip().strip("'\"")
+                  # IDs, ARNs, domains and slugs; plain words like "pulumi" stay readable.
+                  if len(value) >= 6 and re.search(r"[\d./:@_-]", value):
+                      values.add(value)
+
+          def scrub(node):
+              if isinstance(node, dict):
+                  return {
+                      key: "[omitted]" if key == "content" and node.get("type") == "tool_result"
+                      else scrub(item)
+                      for key, item in node.items()
+                      if key != "tool_use_result"
+                  }
+              if isinstance(node, list):
+                  return [scrub(item) for item in node]
+              if isinstance(node, str):
+                  for value in values:
+                      node = node.replace(value, "[redacted]")
+              return node
+
+          lines = [json.dumps(scrub(json.loads(line))) for line in open(transcript) if line.strip()]
+          with open(transcript, "w") as out:
+              out.write("\n".join(lines) + "\n")
+          PY
 
       - name: Upload the audit transcript
         if: always()
