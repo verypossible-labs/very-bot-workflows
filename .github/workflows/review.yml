@@ -29,9 +29,7 @@ on:
 
 env:
   CLAUDE_CODE_VERSION: 2.1.312
-  SKILLS_BUCKET: very-bot-skills
-  SKILLS_ROLE: arn:aws:iam::503561429247:role/very-bot-skills-reader
-  AWS_REGION: us-west-2
+  VERY_BOT_URL: https://eer3g3paoq2q2buc2slrkgdtye0wzhzs.lambda-url.us-west-2.on.aws
 
 jobs:
   review:
@@ -45,13 +43,16 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch Very's review skill
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ env.SKILLS_ROLE }}
-          aws-region: ${{ env.AWS_REGION }}
-      - run: |
-          aws s3 cp "s3://$SKILLS_BUCKET/very-engineering/very-code-review/SKILL.md" \
-            "$HOME/.claude/skills/very-code-review/SKILL.md" --no-progress
+        run: |
+          set -euo pipefail
+          # very-bot checks this token belongs to very-bot-workflows in an active client org.
+          token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$token"
+          mkdir -p "$HOME/.claude/skills/very-code-review"
+          curl -sS --fail-with-body -H "Authorization: Bearer $token" \
+            "$VERY_BOT_URL/skills/very-engineering/very-code-review" \
+            -o "$HOME/.claude/skills/very-code-review/SKILL.md"
 
       - run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
 
