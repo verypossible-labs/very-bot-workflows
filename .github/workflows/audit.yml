@@ -86,8 +86,8 @@ jobs:
               *) echo "::error::very-bot refused $1 (HTTP $status). Ask your Very engineer to check this org's setup."; exit 1 ;;
             esac
           }
-          mkdir -p "$HOME/.claude/skills/$skill"
-          skill_file="$HOME/.claude/skills/$skill/SKILL.md"
+          skill_file="$RUNNER_TEMP/skill/SKILL.md"
+          mkdir -p "$(dirname "$skill_file")"
           fetch "/skills/very-engineering/$skill" "$skill_file"
           # A skill's allowed-tools frontmatter outranks --allowedTools; drop it (and any
           # indented list under it) so the audit stays read-only, and fail if it survives.
@@ -119,14 +119,42 @@ jobs:
           set -euo pipefail
           date -u +%FT%TZ > "$RUNNER_TEMP/started_at"
           date +%s > "$RUNNER_TEMP/started_epoch"
-          # Any static credential silently outranks workload identity.
+          # Claude runs as its own user, so neither the model nor anything the repo tricks
+          # it into running can read this user's environment (the OIDC request
+          # credentials) or the runner's files. Without sudo (some self-hosted runners) it
+          # shares ours.
+          if sudo -n true 2>/dev/null; then
+            sudo useradd --create-home very-bot-model 2>/dev/null || true
+            model_home=/home/very-bot-model
+            as_model() { sudo -u very-bot-model "$@"; }
+          else
+            echo "::warning::No passwordless sudo on this runner; the audit runs as the runner user."
+            model_home="$RUNNER_TEMP/model-home"
+            as_model() { "$@"; }
+          fi
+          as_model mkdir -p "$model_home/.claude/skills/$SKILL" "$model_home/repo" "$model_home/context"
+          as_model cp "$RUNNER_TEMP/skill/SKILL.md" "$model_home/.claude/skills/$SKILL/"
+          as_model cp "$RUNNER_TEMP/client-context.yaml" "$model_home/context/"
+          tar -C . -cf - . | as_model tar -C "$model_home/repo" -xf -
+          # User settings load (--setting-sources user); make them unwritable by the model.
+          echo '{}' | sudo -n tee "$model_home/.claude/settings.json" > /dev/null 2>&1 \
+            && sudo -n chown root:root "$model_home/.claude/settings.json" || true
+
+          # The model's user works only from its own copies; it can't list the runner's temp dir.
+          chmod 700 "$RUNNER_TEMP"
+
+          # The Anthropic JWT is the one credential the model's user can read; it lives ~5
+          # minutes. Any static credential silently outranks workload identity.
           unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-          export ANTHROPIC_IDENTITY_TOKEN_FILE="$RUNNER_TEMP/gha-jwt"
+          jwt_dir=$(mktemp -d)
+          chmod 755 "$jwt_dir"
+          jwt="$jwt_dir/gha-jwt"
           fetch_jwt() {
             curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" \
-              | jq -r .value > "$ANTHROPIC_IDENTITY_TOKEN_FILE.tmp"
-            mv "$ANTHROPIC_IDENTITY_TOKEN_FILE.tmp" "$ANTHROPIC_IDENTITY_TOKEN_FILE"
+              | jq -r .value > "$jwt.tmp"
+            chmod 644 "$jwt.tmp"
+            mv "$jwt.tmp" "$jwt"
           }
           # GitHub OIDC tokens expire in ~5 minutes; Claude Code re-exchanges mid-run.
           fetch_jwt
@@ -139,7 +167,7 @@ jobs:
           This is an unattended CI audit of this repository. Rules:
           - Run only the skill's audit / drift step and report every row of its checklist.
             Ask nothing and change no file in the repository.
-          - The client context is the YAML file $RUNNER_TEMP/client-context.yaml. Read it
+          - The client context is the YAML file $model_home/context/client-context.yaml. Read it
             from there; never call very-mcp or look for .claude/very-client-context.yaml.
           - A row that needs GitHub settings (environments, secrets, rulesets, reviewers),
             AWS, a console, or running the app is not_checked, with the reason as its
@@ -165,19 +193,22 @@ jobs:
                 "detail": {"type": "string", "maxLength": 500},
                 "file": {"type": "string", "maxLength": 300}}}}}}'
 
-          # Nothing from the checkout configures Claude Code: its .claude/ and .mcp.json
-          # can hold hooks and MCP servers that run code in this job.
-          find . -name .claude -prune -exec rm -rf {} +
-          rm -f .mcp.json
-          # The model reads untrusted files, so it gets no way to write, run code, see the
-          # OIDC request credentials (env -u) or read the Anthropic JWT on disk.
-          env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
-            claude -p "$prompt" \
+          # The model reads untrusted files, so it only reads: no writes, no commands beyond
+          # ls, no Anthropic JWT. The repo's own .claude/ and .mcp.json never configure
+          # Claude Code (hooks and MCP servers would run code here), but stay for the audit.
+          as_model env -i HOME="$model_home" PATH="$PATH" \
+            ANTHROPIC_FEDERATION_RULE_ID="$ANTHROPIC_FEDERATION_RULE_ID" \
+            ANTHROPIC_ORGANIZATION_ID="$ANTHROPIC_ORGANIZATION_ID" \
+            ANTHROPIC_SERVICE_ACCOUNT_ID="$ANTHROPIC_SERVICE_ACCOUNT_ID" \
+            ANTHROPIC_WORKSPACE_ID="$ANTHROPIC_WORKSPACE_ID" \
+            ANTHROPIC_IDENTITY_TOKEN_FILE="$jwt" \
+            bash -c 'cd "$1/repo" && shift && exec claude "$@"' _ "$model_home" \
+            -p "$prompt" \
             --model "$MODEL" --output-format stream-json --verbose \
             --setting-sources user --strict-mcp-config --json-schema "$schema" \
             --allowedTools Read Glob Grep "Bash(ls:*)" Agent Task Skill \
             --disallowedTools ScheduleWakeup CronCreate Write Edit NotebookEdit \
-              "Read(/$ANTHROPIC_IDENTITY_TOKEN_FILE*)" "Read(//proc/**)" \
+              "Read(/$jwt*)" "Read(//proc/**)" \
             > "$RUNNER_TEMP/transcript.jsonl" || true
           jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
             > "$RUNNER_TEMP/result.json"
