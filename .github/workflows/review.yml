@@ -81,18 +81,31 @@ jobs:
           fetch_jwt
           (while sleep 240; do fetch_jwt; done) &
 
+          # The full transcript is uploaded below, so slow or wrong reviews can be traced.
           claude -p "/very-code-review $PR_URL" \
-            --model "$MODEL" --output-format json \
+            --model "$MODEL" --output-format stream-json --verbose \
             --allowedTools "Bash(gh:*)" "Bash(git:*)" "Bash(jq:*)" Read Glob Grep Agent Task Skill \
-            > "$RUNNER_TEMP/result.json" || true
+            > "$RUNNER_TEMP/transcript.jsonl" || true
+          jq -c 'select(.type == "result")' "$RUNNER_TEMP/transcript.jsonl" | tail -1 \
+            > "$RUNNER_TEMP/result.json"
           jq '{is_error, num_turns, total_cost_usd, duration_ms}' "$RUNNER_TEMP/result.json"
 
-          if jq -e '.is_error' "$RUNNER_TEMP/result.json" > /dev/null; then
+          # A missing result line (crash, kill) counts as a failure too.
+          if ! jq -e '.is_error == false' "$RUNNER_TEMP/result.json" > /dev/null; then
             if jq -r '.result' "$RUNNER_TEMP/result.json" | grep -q "usage limits"; then
               gh pr comment "$PR_URL" --body "very-bot couldn't review this PR: this month's review budget is used up. Ask your Very engineer to raise it."
             fi
             exit 1
           fi
+
+      - name: Upload the review transcript
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: very-review-transcript-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/transcript.jsonl
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Remove the label so it can be re-added for another review
         if: always()
