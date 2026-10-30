@@ -148,11 +148,17 @@ jobs:
             AWS, a console, or running the app is not_checked, with the reason as its
             detail. Never guess.
           - Write $findings as
-            {\"checks\": [{\"check\": \"<the row's check text, verbatim>\",
+            {\"checks\": [{\"id\": \"<the row's ID, verbatim>\",
+              \"check\": \"<the row's check text, verbatim, at most 200 characters>\",
               \"status\": \"pass\" | \"fail\" | \"not_checked\",
-              \"detail\": \"<one line: what's wrong, or why not checked>\",
-              \"file\": \"<path, when one applies>\"}]}
-            with one entry per row, in the skill's order."
+              \"detail\": \"<what's wrong, or why not checked>\",
+              \"file\": \"<repo-relative path, when one applies>\"}]}
+            with one entry per row, in the skill's order.
+          - detail is plain prose of at most 500 characters. Never quote code, config
+            values, secrets or identifiers from the repository in it: it leaves this
+            repository. Say what is wrong, not what the file contains.
+          - file is relative to the repository root (no leading / and no ..), at most
+            300 characters."
 
           claude -p "$prompt" \
             --model "$MODEL" --output-format stream-json --verbose \
@@ -179,14 +185,21 @@ jobs:
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
           echo "::add-mask::$token"
           # Argus applies accepted drift and answers with the final statuses.
-          if ! jq -c --arg skill "$SKILL" --argjson issue "$ISSUE" \
+          status=$(jq -c --arg skill "$SKILL" --argjson issue "$ISSUE" \
               '{skill: $skill, issue: $issue, checks: .checks}' "$RUNNER_TEMP/findings.json" \
-            | curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" \
+            | curl -sS -w '%{http_code}' -X POST -H "Authorization: Bearer $token" \
               -H "content-type: application/json" --data @- "$VERY_BOT_URL/audits" \
-              > "$RUNNER_TEMP/final.json"; then
-            echo "::warning::Couldn't record the findings with Very; posting them without accepted drift."
-            cp "$RUNNER_TEMP/findings.json" "$RUNNER_TEMP/final.json"
-          fi
+              -o "$RUNNER_TEMP/final.json")
+          case "$status" in
+            200) ;;
+            409)
+              # A newer audit replaced this one; very-bot already closed this issue saying so.
+              echo "::notice::$(cat "$RUNNER_TEMP/final.json"); not posting these findings."
+              exit 0 ;;
+            *)
+              echo "::warning::Couldn't record the findings with Very (HTTP $status); posting them without accepted drift."
+              cp "$RUNNER_TEMP/findings.json" "$RUNNER_TEMP/final.json" ;;
+          esac
 
           jq -r --arg skill "$SKILL" --arg run "$RUN_URL" --arg sha "${GITHUB_SHA:0:7}" '
             def count(s): [.checks[] | select(.status == s)] | length;
