@@ -270,17 +270,19 @@ jobs:
         run: |
           t="$RUNNER_TEMP/transcript.jsonl"
           [ -f "$t" ] || exit 0
-          python3 - "$t" "$RUNNER_TEMP/client-context.yaml" <<'PY' || rm -f "$t"
+          # -I: never import from the checkout, where a json.py or re.py would shadow stdlib.
+          python3 -I - "$t" "$RUNNER_TEMP/client-context.yaml" <<'PY' || rm -f "$t"
           import json, os, re, sys
 
           transcript, context = sys.argv[1], sys.argv[2]
-          values = set()
-          if os.path.exists(context):
-              for line in open(context):
-                  value = re.sub(r"^\s*(-\s+)?([\w.-]+:\s*)?", "", line).strip().strip("'\"")
-                  # IDs, ARNs, domains and slugs; plain words like "pulumi" stay readable.
-                  if len(value) >= 6 and re.search(r"[\d./:@_-]", value):
-                      values.add(value)
+          # Every identifier-like token in the file, keys and comments included, so inline
+          # comments and [a, b] lists can't hide a value. Plain words like "pulumi" stay.
+          tokens = re.findall(r"[\w.:/@+-]{6,}", open(context).read()) if os.path.exists(context) else []
+          values = sorted(
+              {t.strip(":.,-") for t in tokens if re.search(r"[\d./:@_-]", t.strip(":.,-"))},
+              key=len,
+              reverse=True,
+          )
 
           def scrub(node):
               if isinstance(node, dict):
