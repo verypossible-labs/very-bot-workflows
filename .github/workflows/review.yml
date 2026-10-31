@@ -292,6 +292,8 @@ jobs:
           # The model can't reach our tokens, but never post anything shaped like one.
           TOKEN = re.compile(r"eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}|gh[pousr]_\w{20,}|github_pat_\w{20,}")
           MARKER = "_very-code-review"
+          # very-bot reads these reactions when the PR closes.
+          FEEDBACK = "Was this useful? React 👍 or 👎 on this review or on any finding."
 
           def clean(text):
               return TOKEN.sub("[redacted]", text)
@@ -372,13 +374,13 @@ jobs:
           if moved:
               body = above_marker(body, as_list(moved))
           head = json.load(open(f"{bundle}/pr.json"))["headRefOid"]
-          payload = {"commit_id": head, "event": "COMMENT", "body": body, "comments": inline}
+          payload = {"commit_id": head, "event": "COMMENT", "body": above_marker(body, FEEDBACK), "comments": inline}
           try:
               github("POST", f"/repos/{repo}/pulls/{pr}/reviews", payload)
           except urllib.error.HTTPError as exc:
               if exc.code != 422 or not inline:
                   raise
-              payload |= {"comments": [], "body": above_marker(body, as_list(inline))}
+              payload |= {"comments": [], "body": above_marker(above_marker(body, as_list(inline)), FEEDBACK)}
               github("POST", f"/repos/{repo}/pulls/{pr}/reviews", payload)
           PY
 
