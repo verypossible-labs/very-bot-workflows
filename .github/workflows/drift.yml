@@ -70,7 +70,7 @@ jobs:
             jq -n --arg config "$config" --arg env "$env" --arg stack "$stack" --argjson runs "$runs" \
               '{config: $config, env: $env, stack: $stack, runs: $runs}'
           done > "$RUNNER_TEMP/stacks.jsonl"
-          echo "matrix=$(jq -sc '{include: [.[] | select(.runs) | {config, env}]}' "$RUNNER_TEMP/stacks.jsonl")" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -sc '{include: [.[] | select(.runs) | {config, env, stack}]}' "$RUNNER_TEMP/stacks.jsonl")" >> "$GITHUB_OUTPUT"
           echo "gated=$(jq -sc '[.[] | select(.runs | not) | {stack, gated: true}]' "$RUNNER_TEMP/stacks.jsonl")" >> "$GITHUB_OUTPUT"
 
   drift:
@@ -86,6 +86,7 @@ jobs:
     env:
       PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
       CONFIG: ${{ matrix.config }}
+      STACK: ${{ matrix.stack }}
     steps:
       - uses: actions/checkout@v7
 
@@ -132,9 +133,9 @@ jobs:
         env:
           REPORT: ${{ runner.temp }}/drift/${{ steps.name.outputs.report }}
         run: |
-          # The driver names the stack once its config loads; before that, the file has to.
+          # The driver names the stack once its config loads; before that, the stacks job's name stands in.
           mkdir -p "$(dirname "$REPORT")"
-          [ -s "$REPORT" ] || jq -n --arg stack "$(basename "${CONFIG%.*}")" '{stack: $stack}' > "$REPORT"
+          [ -s "$REPORT" ] || jq -n --arg stack "$STACK" '{stack: $stack}' > "$REPORT"
 
       - if: always()
         uses: actions/upload-artifact@v4
@@ -178,7 +179,7 @@ jobs:
             --data @"$RUNNER_TEMP/stacks.json")
           case "$status" in
             202) ;;
-            404) echo "::error::Very has no client for this repo. Ask your Very engineer to add it to its System in Argus."; exit 1 ;;
+            404) echo "::error::Very has no active client linked to this repo. Ask your Very engineer to add it to its System in Argus."; exit 1 ;;
             503) echo "::error::Very couldn't record the drift report; the next run reports again. If this repeats, tell your Very engineer."; exit 1 ;;
             *) echo "::error::very-bot refused the drift report (HTTP $status)."; exit 1 ;;
           esac
