@@ -18,6 +18,10 @@ They're public so your repositories can call them; nothing else about very-bot l
   replaces it. Only very-bot's own issues start an audit.
 - **Security and dependency checks.** Weekly checks of repository settings, Dependabot
   alerts and outdated dependencies, using GitHub's API.
+- **Infrastructure drift checks.** A repository with Pulumi stacks can run `drift.yml`
+  nightly on `main`. It compares each stack's live resources with its saved state, using
+  your own AWS role and saving nothing, and reports only which resources drifted: their
+  type, name and the change, never their settings or secrets.
 
 ## What it can and can't do
 

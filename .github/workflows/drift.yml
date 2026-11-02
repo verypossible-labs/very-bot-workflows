@@ -1,0 +1,185 @@
+name: very-bot drift
+
+# Reusable workflow a repo runs nightly on main. It refreshes each Pulumi stack without
+# saving anything and reports which resources drifted (type, name and change, never
+# values) to Argus through very-bot. It changes nothing in AWS; each refresh briefly
+# holds its stack's lock, so a deploy at that moment waits for the next attempt.
+#
+# Callers pass `secrets: inherit`. With `use-environments`, each stack runs in the GitHub
+# environment named by its config's metadata.env, so that environment's AWS_OIDC_ROLE and
+# PULUMI_CONFIG_PASSPHRASE apply; otherwise the repo-level ones do. List only environments
+# without required reviewers in `environments`: the rest report as not checked, since a
+# nightly job would wait for approval and hold up every stack's report.
+
+on:
+  workflow_call:
+    inputs:
+      config-directory:
+        description: The repo's Pulumi stack configs, one per stack
+        type: string
+        default: pulumi/config
+      use-environments:
+        description: Run each stack in the GitHub environment its config names
+        type: boolean
+        default: false
+      environments:
+        description: With use-environments, the environments drift runs in, space-separated
+        type: string
+        default: dev
+      aws-region:
+        type: string
+        default: us-west-2
+      codeartifact-domain-owner:
+        description: The account holding Very's CodeArtifact domain
+        type: string
+        default: "258760970740"
+
+env:
+  VERY_BOT_URL: https://eer3g3paoq2q2buc2slrkgdtye0wzhzs.lambda-url.us-west-2.on.aws
+
+jobs:
+  stacks:
+    # very-bot also refuses drift from any other ref: drift is measured against main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      gated: ${{ steps.list.outputs.gated }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        env:
+          CONFIGS: ${{ inputs.config-directory }}
+          USE_ENVIRONMENTS: ${{ inputs.use-environments }}
+          ENVIRONMENTS: ${{ inputs.environments }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          configs=("$CONFIGS"/*.yaml "$CONFIGS"/*.yml)
+          if [ ${#configs[@]} -eq 0 ]; then
+            echo "::error::No Pulumi stack configs in $CONFIGS."
+            exit 1
+          fi
+          for config in "${configs[@]}"; do
+            env=$(yq -r '.metadata.env // ""' "$config")
+            stack="$(yq -r '.metadata.stackName // ""' "$config")-$env"
+            runs=true
+            if [ "$USE_ENVIRONMENTS" = true ] && ! [[ " $ENVIRONMENTS " == *" $env "* ]]; then
+              runs=false
+            fi
+            jq -n --arg config "$config" --arg env "$env" --arg stack "$stack" --argjson runs "$runs" \
+              '{config: $config, env: $env, stack: $stack, runs: $runs}'
+          done > "$RUNNER_TEMP/stacks.jsonl"
+          echo "matrix=$(jq -sc '{include: [.[] | select(.runs) | {config, env, stack}]}' "$RUNNER_TEMP/stacks.jsonl")" >> "$GITHUB_OUTPUT"
+          echo "gated=$(jq -sc '[.[] | select(.runs | not) | {stack, gated: true}]' "$RUNNER_TEMP/stacks.jsonl")" >> "$GITHUB_OUTPUT"
+
+  drift:
+    needs: stacks
+    if: fromJSON(needs.stacks.outputs.matrix).include[0] != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.stacks.outputs.matrix) }}
+    # Empty means no environment, so the repo-level secrets apply.
+    environment: ${{ inputs.use-environments && matrix.env || '' }}
+    env:
+      PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+      CONFIG: ${{ matrix.config }}
+      STACK: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: name
+        run: echo "report=$(basename "${CONFIG%.*}").json" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the stack's dependencies
+        working-directory: pulumi
+        env:
+          OWNER: ${{ inputs.codeartifact-domain-owner }}
+          REGION: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          token=$(aws codeartifact get-authorization-token --domain very --domain-owner "$OWNER" \
+            --region "$REGION" --query authorizationToken --output text)
+          echo "::add-mask::$token"
+          index="https://aws:$token@very-$OWNER.d.codeartifact.$REGION.amazonaws.com/pypi/python-packages/simple/"
+          echo "UV_EXTRA_INDEX_URL=$index" >> "$GITHUB_ENV"
+          UV_EXTRA_INDEX_URL="$index" uv sync
+          if ! uv run very-pulumi-driver --help | grep -q drift; then
+            echo "::error::This repo's very-pulumi-driver predates drift checks. Upgrade it (uv lock --upgrade-package very-pulumi-driver)."
+            exit 1
+          fi
+
+      - name: Check for drift
+        working-directory: pulumi
+        env:
+          REPORT: ${{ runner.temp }}/drift/${{ steps.name.outputs.report }}
+        run: |
+          mkdir -p "$(dirname "$REPORT")"
+          uv run very-pulumi-driver -c "../$CONFIG" -a drift --report "$REPORT"
+
+      - name: Keep the report
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/drift/${{ steps.name.outputs.report }}
+        run: |
+          # The driver names the stack once its config loads; before that, the stacks job's name stands in.
+          mkdir -p "$(dirname "$REPORT")"
+          [ -s "$REPORT" ] || jq -n --arg stack "$STACK" '{stack: $stack}' > "$REPORT"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-${{ steps.name.outputs.report }}
+          path: ${{ runner.temp }}/drift/${{ steps.name.outputs.report }}
+          retention-days: 3
+
+  report:
+    # Outside any environment, so the token very-bot checks says main.
+    needs: [stacks, drift]
+    if: always() && needs.stacks.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        if: needs.drift.result != 'skipped'
+        with:
+          pattern: drift-*
+          path: ${{ runner.temp }}/drift
+          merge-multiple: true
+
+      - name: Report to Argus
+        env:
+          GATED: ${{ needs.stacks.outputs.gated }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/drift/*.json)
+          jq -s --argjson gated "$GATED" '{stacks: (. + $gated)}' "${files[@]}" /dev/null \
+            > "$RUNNER_TEMP/stacks.json"
+          if [ "$(jq '.stacks | length' "$RUNNER_TEMP/stacks.json")" -eq 0 ]; then
+            echo "::error::No stack produced a drift report."
+            exit 1
+          fi
+          # very-bot checks this token belongs to very-bot-workflows' drift.yml on main.
+          token=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=very-bot" | jq -r .value)
+          echo "::add-mask::$token"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$VERY_BOT_URL/drift" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            --data @"$RUNNER_TEMP/stacks.json")
+          case "$status" in
+            202) ;;
+            404) echo "::error::Very has no active client linked to this repo. Ask your Very engineer to add it to its System in Argus."; exit 1 ;;
+            503) echo "::error::Very couldn't record the drift report; the next run reports again. If this repeats, tell your Very engineer."; exit 1 ;;
+            *) echo "::error::very-bot refused the drift report (HTTP $status)."; exit 1 ;;
+          esac
