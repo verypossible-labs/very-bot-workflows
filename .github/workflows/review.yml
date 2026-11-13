@@ -107,7 +107,7 @@ jobs:
           set -euo pipefail
           bundle="$RUNNER_TEMP/bundle"
           mkdir -p "$bundle"
-          gh pr view "$PR" --json number,url,state,isDraft,headRefOid,baseRefName,author,title,files \
+          gh pr view "$PR" --json number,url,state,isDraft,headRefOid,baseRefName,author,title,body,files \
             > "$bundle/pr.json"
           # The skill's eligibility rule: closed, draft and bot-authored PRs get no review.
           if ! jq -e '.state == "OPEN" and (.isDraft | not) and ((.author.is_bot // false) | not)' \
