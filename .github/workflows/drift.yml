@@ -93,12 +93,12 @@ jobs:
       - id: name
         run: echo "report=$(basename "${CONFIG%.*}").json" >> "$GITHUB_OUTPUT"
 
-      - uses: aws-actions/configure-aws-credentials@v5
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
           aws-region: ${{ inputs.aws-region }}
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
 
@@ -138,7 +138,7 @@ jobs:
           [ -s "$REPORT" ] || jq -n --arg stack "$STACK" '{stack: $stack}' > "$REPORT"
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: drift-${{ steps.name.outputs.report }}
           path: ${{ runner.temp }}/drift/${{ steps.name.outputs.report }}
@@ -150,7 +150,7 @@ jobs:
     if: always() && needs.stacks.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.drift.result != 'skipped'
         with:
           pattern: drift-*
